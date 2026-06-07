@@ -1,0 +1,15 @@
+[package]
+name = "klug"
+version = "${file:VERSION}"
+description = "klug — userland reader for the AGNOS kernel log (the Kernel Logs Unified Grep ring buffer). A sovereign dmesg: dumps the unified kernel log to stdout, with an optional severity lens; `klug | grep …` for everything else."
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.0.56"
+
+[build]
+entry = "src/main.cyr"
+test = "tests/klug.tcyr"
+output = "klug"
+
+[deps]
+stdlib = ["string", "fmt", "alloc", "io", "syscalls", "args", "assert"]

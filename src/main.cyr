@@ -1,0 +1,35 @@
+# main.cyr — klug entry point. Parses the severity flag and dumps the kernel
+# log. The reader logic lives in src/klug.cyr.
+
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/io.cyr"
+include "lib/args.cyr"
+include "src/klug.cyr"
+
+# 16 KB read buffer matching the kernel ring. A module-global `var X[N]`
+# allocates N×u64, so var[2048] = 16384 bytes = KLUG_RING_BYTES.
+var klug_buf[2048];
+
+fn main(): i64 {
+    args_init();
+    var min_level = KLUG_LVL_ALL;
+    var ac = argc();
+    var i = 1;
+    while (i < ac) {
+        var a = argv(i);
+        if (streq(a, "-h") == 1)     { return klug_usage(); }
+        if (streq(a, "--help") == 1) { return klug_usage(); }
+        if (streq(a, "-e") == 1)     { min_level = KLUG_LVL_ERR; }
+        if (streq(a, "--err") == 1)  { min_level = KLUG_LVL_ERR; }
+        if (streq(a, "-w") == 1)     { min_level = KLUG_LVL_WARN; }
+        if (streq(a, "--warn") == 1) { min_level = KLUG_LVL_WARN; }
+        i = i + 1;
+    }
+    return klug_dump(min_level, &klug_buf);
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

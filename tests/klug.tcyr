@@ -1,0 +1,65 @@
+# klug test suite — the severity lens.
+#
+# klug's dump path is thin syscall I/O (klog#36 → stdout on agnos, /dev/kmsg on
+# the dev host) and is integration-tested via the agnos exec path (`run /bin/klug`
+# on a booted kernel — see the agnos iron tracker, item H5). The pure,
+# host-testable logic is `klug_level_of`, the lens that decides whether a line
+# passes -w/-e; this harness pins it against the kernel's "[I] " / "[W] " /
+# "[E] " prefix contract (core/klug.cyr's klog_info/warn/err).
+
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/io.cyr"
+include "lib/assert.cyr"
+include "src/klug.cyr"
+
+fn _level(s): i64 {
+    return klug_level_of(s, strlen(s));
+}
+
+fn test_recognized_prefixes() {
+    assert(_level("[E] disk error\n") == KLUG_LVL_ERR, "err prefix -> ERR");
+    assert(_level("[W] low memory\n") == KLUG_LVL_WARN, "warn prefix -> WARN");
+    assert(_level("[I] booting\n") == KLUG_LVL_ALL, "info prefix -> ALL");
+    return 0;
+}
+
+fn test_unprefixed_lines_always_show() {
+    assert(_level("ext2: mounted\n") == KLUG_LVL_ALL, "plain line -> ALL");
+    assert(_level("") == KLUG_LVL_ALL, "empty -> ALL");
+    assert(_level("[X] weird\n") == KLUG_LVL_ALL, "unknown level char -> ALL");
+    assert(_level("[E]") == KLUG_LVL_ALL, "too short (no body) -> ALL");
+    assert(_level("[E") == KLUG_LVL_ALL, "no closing bracket -> ALL");
+    return 0;
+}
+
+fn test_severity_ordering() {
+    # The -w/-e filters rely on this ascending order.
+    assert(KLUG_LVL_ALL < KLUG_LVL_WARN, "ALL < WARN");
+    assert(KLUG_LVL_WARN < KLUG_LVL_ERR, "WARN < ERR");
+    return 0;
+}
+
+fn test_ring_size_matches_kernel() {
+    # klug_buf in main.cyr (var[2048] = 16384 B) must equal the kernel ring so a
+    # single klog#36 read drains it. Pin the contract.
+    assert(KLUG_RING_BYTES == 16384, "ring buffer = 16 KB (kernel klug_buf)");
+    return 0;
+}
+
+fn main(): i64 {
+    test_group("klug severity lens — recognized prefixes");
+    test_recognized_prefixes();
+    test_group("klug severity lens — unprefixed / malformed");
+    test_unprefixed_lines_always_show();
+    test_group("klug severity ordering");
+    test_severity_ordering();
+    test_group("klug ring-size contract");
+    test_ring_size_matches_kernel();
+    return assert_summary();
+}
+
+var exit_code = main();
+syscall(SYS_EXIT, exit_code);

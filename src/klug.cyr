@@ -1,0 +1,110 @@
+# klug.cyr — the klug reader: kernel-log dump + optional severity lens.
+#
+# klug is the *Kernel Logs Unified Grep* subsystem. The kernel half (the agnos
+# kernel's `core/klug.cyr`) unifies every line of kernel output into one 16 KB
+# ring buffer; this is the userland half — a sovereign `dmesg` that copies that
+# ring to stdout. Filtering past the severity lens stays the shell's job:
+# `klug | grep panic`. The kernel UNIFIES, GREP stays userland.
+#
+# Pure helpers + the dump routine live here (no top-level execution) so the test
+# harness can include the module. `src/main.cyr` is the entry. The libs this
+# module uses (syscalls / io / string) are included by main.cyr and the harness
+# before this file, per the project-include convention.
+
+# The agnos klug ring is 16 KB. `klog`#36 fills up to this many bytes (oldest→
+# newest; a smaller buffer would get the newest-N tail, but we always pass the
+# full ring size so one read drains it all).
+var KLUG_RING_BYTES = 16384;
+
+# Minimum-severity filter, ascending.
+var KLUG_LVL_ALL  = 0;   # show everything (default)
+var KLUG_LVL_WARN = 1;   # warnings + errors
+var KLUG_LVL_ERR  = 2;   # errors only
+
+# The kernel's klog_info/klog_warn/klog_err prefix lines with "[I] " / "[W] " /
+# "[E] " (see core/klug.cyr). Return the severity of a line beginning at `p`
+# (length `len`): 2=err, 1=warn, 0=info/plain. Lines without a recognized prefix
+# are level 0 — always shown (boot lines, raw kprintln output, etc.).
+fn klug_level_of(p, len): i64 {
+    if (len < 4) { return KLUG_LVL_ALL; }
+    if (load8(p) != 91) { return KLUG_LVL_ALL; }       # '[' = 91
+    if (load8(p + 2) != 93) { return KLUG_LVL_ALL; }   # ']' = 93
+    var c = load8(p + 1);
+    if (c == 69) { return KLUG_LVL_ERR; }              # 'E' = 69
+    if (c == 87) { return KLUG_LVL_WARN; }             # 'W' = 87
+    return KLUG_LVL_ALL;                               # 'I' or anything else
+}
+
+fn klug_usage(): i64 {
+    println("klug — dump the AGNOS kernel log (the klug unified ring buffer).");
+    println("");
+    println("usage: klug [-w|--warn] [-e|--err] [-h|--help]");
+    println("  (no flags)   dump the whole kernel log");
+    println("  -w, --warn   only warnings and errors ([W]/[E])");
+    println("  -e, --err    only errors ([E])");
+    println("  -h, --help   this help");
+    println("");
+    println("filter further with the shell: klug | grep <pattern>");
+    return 0;
+}
+
+# Read the kernel log into `buf` (must be KLUG_RING_BYTES bytes) and write the
+# lines at or above `min_level` to stdout. Returns 0 on success, 1 on read
+# failure.
+fn klug_dump(min_level, buf): i64 {
+    var n = 0;
+    #ifdef CYRIUS_TARGET_AGNOS
+    # Native: klog#36 copies the klug ring into buf and returns bytes written. It
+    # only ever copies klug_buf, never other kernel memory, so it can't leak.
+    n = syscall(36, buf, KLUG_RING_BYTES);
+    if (n < 0) { println("klug: kernel log read failed"); return 1; }
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    # Dev-host dogfooding: the klug ring is agnos-only, so dump the Linux kernel
+    # ring via /dev/kmsg (world-readable on modern Linux). O_RDONLY|O_NONBLOCK so
+    # read returns once the buffer is drained (EAGAIN) instead of blocking for
+    # future messages; one record per read, accumulated into buf up to capacity.
+    var fd = syscall(SYS_OPEN, "/dev/kmsg", 2048, 0);   # 2048 = O_NONBLOCK (0o4000)
+    if (fd < 0) {
+        println("klug: kernel log unavailable on this host (open /dev/kmsg failed);");
+        println("      the native reader is agnos klog#36 — build with `cyrius build --agnos`.");
+        return 1;
+    }
+    var off = 0;
+    var draining = 1;
+    while (draining == 1) {
+        if (off >= KLUG_RING_BYTES) { draining = 0; }
+        else {
+            var m = syscall(SYS_READ, fd, buf + off, KLUG_RING_BYTES - off);
+            if (m <= 0) { draining = 0; }
+            else { off = off + m; }
+        }
+    }
+    syscall(SYS_CLOSE, fd);
+    n = off;
+    #endif
+    if (n <= 0) { return 0; }
+    # Fast path: no filtering → one write of the whole ring.
+    if (min_level == KLUG_LVL_ALL) {
+        syscall(SYS_WRITE, 1, buf, n);
+        return 0;
+    }
+    # Filtered: emit line-by-line, dropping lines below min_level.
+    var i = 0;
+    var start = 0;
+    while (i < n) {
+        if (load8(buf + i) == 10) {                    # '\n' = 10
+            if (klug_level_of(buf + start, i - start + 1) >= min_level) {
+                syscall(SYS_WRITE, 1, buf + start, i - start + 1);
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (start < n) {                                    # trailing partial line
+        if (klug_level_of(buf + start, n - start) >= min_level) {
+            syscall(SYS_WRITE, 1, buf + start, n - start);
+        }
+    }
+    return 0;
+}
