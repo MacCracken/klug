@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-06-08 (agnos argv fix)
+
+### Changed
+
+- cyrius toolchain pin 6.0.56 → 6.1.14.
+
+### Fixed
+
+- **agnos: command-line args (e.g. severity-lens flags) weren't seen.** Call `main` from a bare top-level statement (`_agnos_entry();`) instead of `var r = main();`. The latter runs `main` as a module-global initializer, *before* cyrius's init-stack capture, so `argc()`/`argv()` read 0/null. cyrius issue: agnos argv init-rsp capture.
+
 ## [0.1.0] — 2026-06-06 (the userland half of klug — a sovereign dmesg)
 
 ### Added
