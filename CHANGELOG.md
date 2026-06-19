@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-06-19 (cyrius toolchain bump)
+
+### Changed
+
+- cyrius toolchain pin 6.1.14 → 6.2.24.
+
 ## [0.1.1] — 2026-06-08 (agnos argv fix)
 
 ### Changed
