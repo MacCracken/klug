@@ -10,8 +10,8 @@ include "lib/args.cyr"
 include "src/klug.cyr"
 
 # 16 KB read buffer matching the kernel ring. A module-global `var X[N]`
-# allocates N×u64, so var[2048] = 16384 bytes = KLUG_RING_BYTES.
-var klug_buf[2048];
+# allocates N×u64, so var[8192] = 65536 bytes = KLUG_RING_BYTES (64 KB, matches the kernel ring).
+var klug_buf[8192];
 
 fn main(): i64 {
     args_init();

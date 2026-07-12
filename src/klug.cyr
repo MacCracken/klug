@@ -14,7 +14,7 @@
 # The agnos klug ring is 16 KB. `klog`#36 fills up to this many bytes (oldest→
 # newest; a smaller buffer would get the newest-N tail, but we always pass the
 # full ring size so one read drains it all).
-var KLUG_RING_BYTES = 16384;
+var KLUG_RING_BYTES = 65536;
 
 # Minimum-severity filter, ascending.
 var KLUG_LVL_ALL  = 0;   # show everything (default)
