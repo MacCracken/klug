@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-07-12 (64 KB ring)
+
+### Changed
+
+- **Ring read buffer 16 KB → 64 KB**, in lockstep with the agnos kernel ring (`core/klug.cyr`):
+  `KLUG_RING_BYTES` 16384 → 65536 and `main.cyr` `klug_buf[2048]` → `[8192]`. The tool's buffer and the
+  kernel ring MUST match — `klog#36` returns at most the tool's requested size, so a buffer smaller than
+  the ring pulls only the tail.
+
+### Fixed
+
+- **The tool could only return the last 16 KB of the kernel log, losing the earliest boot lines.** The
+  iron boot log outgrew 16 KB (the agnos GPU arc + full device enumeration + SMP push a clean boot to
+  ~16–20 KB), so the kernel ring wrapped dmesg-style and the reader faithfully returned the wrapped
+  tail — which read as "the log starts partway through / stops at the kybernet handoff." 64 KB holds the
+  whole boot log ~3× over. The `tests/klug.tcyr` ring-size contract now pins 64 KB (it caught the
+  kernel/tool mismatch, as designed). Requires the paired agnos kernel change (klug ring → 64 KB).
+
 ## [0.1.2] — 2026-06-19 (cyrius toolchain bump)
 
 ### Changed
