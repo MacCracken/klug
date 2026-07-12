@@ -43,9 +43,11 @@ fn test_severity_ordering() {
 }
 
 fn test_ring_size_matches_kernel() {
-    # klug_buf in main.cyr (var[2048] = 16384 B) must equal the kernel ring so a
-    # single klog#36 read drains it. Pin the contract.
-    assert(KLUG_RING_BYTES == 16384, "ring buffer = 16 KB (kernel klug_buf)");
+    # klug_buf in main.cyr (var[8192] = 65536 B) must equal the kernel ring
+    # (core/klug.cyr) so a single klog#36 read drains it. Pin the contract.
+    # Bumped 16 KB -> 64 KB: the iron boot log (GPU arc + full device enum + SMP)
+    # grew past 16 KB, so the old ring wrapped and lost the earliest boot lines.
+    assert(KLUG_RING_BYTES == 65536, "ring buffer = 64 KB (kernel klug_buf)");
     return 0;
 }
 
