@@ -46,6 +46,13 @@ enum SysNr {
     SYS_FCNTL = 25;
     SYS_IOCTL = 29;
 
+    # v6.2.14: EMIT the x86 numbers (74/75) — the backend ESYSXLAT renumbers them to
+    # the aarch64 fsync(82)/fdatasync(83). Using the aarch64-native 82/83 directly
+    # is WRONG: 82 is x86 *rename*, which ESYSXLAT remaps 82→128 (renameat) → syscall(82)
+    # would call rename(fd,…) and return -EFAULT, not fsync. See feedback on the
+    # aarch64 ESYSXLAT collision class + emit.cyr's 74→82/75→83 entries.
+    SYS_FSYNC = 74;
+    SYS_FDATASYNC = 75;
     # At-family (aarch64 has no bare open/stat/mkdir/etc.)
     SYS_OPENAT = 56;        # → sys_open  (AT_FDCWD)
     # v6.1.3: newfstatat uses the X86 number 262 (not the aarch64-native 79),
@@ -113,6 +120,7 @@ enum SysNr {
     SYS_SYNC = 81;
     SYS_REBOOT = 142;
     SYS_UNAME = 160;
+    SYS_SYSINFO = 179;
 
     # Signals + sync primitives
     SYS_RT_SIGPROCMASK = 135;
@@ -361,6 +369,29 @@ var LINUX_REBOOT_MAGIC2 = 672274793;
 # ...
 # Total = 128 bytes; we use STAT_BUFSZ = 144 (= max of both arches)
 # so consumer alloc/var sites stay arch-clean.
+#
+# This file is included for BOTH aarch64-Linux AND macho-arm (arm64-macOS); the
+# ESYSXLAT macho branch renumbers newfstatat(262)→Darwin fstatat64(470), which
+# fills a Darwin `struct stat64` whose field offsets differ from the Linux
+# generic-stat layout. So the Stat enum is per-OS (mirrors the OpenFlag split
+# above). Darwin arm64 offsets EMPIRICALLY verified on ecb (v6.1.20):
+# st_mode@4, st_size@96, st_mtimespec@48 (sec) / @56 (nsec). Note these differ
+# from x86-macOS's legacy-stat layout in syscalls_macos.cyr (st_size@72) — the
+# arm64 fstatat64 struct is the modern stat64 with birthtimespec.
+# See issues/2026-06-08-macho-arm-at-family-darwin-syscall-mappings.md.
+#ifdef CYRIUS_TARGET_MACOS
+enum Stat {
+    STAT_MODE = 4;
+    STAT_NLINK = 6;
+    STAT_UID = 16;
+    STAT_GID = 20;
+    STAT_SIZE = 96;
+    STAT_MTIME = 48;
+    STAT_MTIME_NSEC = 56;
+    STAT_BUFSZ = 144;
+}
+#endif
+#ifdef CYRIUS_TARGET_LINUX
 enum Stat {
     STAT_MODE = 16;
     STAT_NLINK = 20;
@@ -371,6 +402,7 @@ enum Stat {
     STAT_MTIME_NSEC = 96;
     STAT_BUFSZ = 144;
 }
+#endif
 
 # ================================================================
 # Syscall wrappers
@@ -417,6 +449,19 @@ fn sys_rmdir(path): i64 {
 # Translates to unlinkat(AT_FDCWD, path, 0).
 fn sys_unlink(path): i64 {
     return syscall(SYS_UNLINKAT, AT_FDCWD, path, 0);
+}
+
+# v6.2.14: flush a file's data + metadata to stable storage. Returns 0 / -errno.
+# aarch64 fsync is 82 (74 on x86_64); the bare wrapper hides the gap — a raw
+# syscall(74) here would hit sched_yield (returns 0 → a silently-fake fsync).
+# See proposal 2026-05-20-syscalls-fsync-stdlib.md.
+fn sys_fsync(fd): i64 {
+    return syscall(SYS_FSYNC, fd);
+}
+
+# v6.2.14: flush file DATA only (not metadata). aarch64 fdatasync is 83.
+fn sys_fdatasync(fd): i64 {
+    return syscall(SYS_FDATASYNC, fd);
 }
 
 # Create a symbolic link at `linkpath` pointing to `target`.
