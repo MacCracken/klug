@@ -40,6 +40,35 @@ cyrius test tests/klug.tcyr                    # tests
 On AGNOS, klug is staged onto the agnos-fs `/bin` via `agnos/scripts/burn/stage-tools.sh`
 and run through the shell's exec-from-disk path.
 
+## On AGNOS: redirect, don't dump
+
+**Reading the log on the console consumes the log.** Redirect it:
+
+```sh
+run /bin/klug > /klug.txt     # do this
+run /bin/klug                 # this eats the boot log
+```
+
+Every console-bound ring-3 byte is fed back into the klug ring: fd 1 is a
+`VFS_DEVICE`, so a `write(1, …)` takes `vfs_write`'s device arm → `dev_write` →
+`serial_dev_write` (`core/devs.cyr`) → `kprint` → `klug_append` — the very ring
+`klug`#36 just read. Since the dump is up to 64 KB and the ring is exactly 64 KB,
+a console dump re-appends the whole log to itself. While the ring is still short
+of full (a ~20 KB boot log) that *doubles* it; the next dump wraps and takes the
+boot head with it.
+
+A pipe is safe for the same reason the redirect is — a pipe fd takes `vfs_write`'s
+`VFS_PIPE` arm and never reaches `kprint`, so only grep's matched lines are
+console-bound:
+
+```sh
+run /bin/klug | grep panic    # fine — only the matches hit the console
+```
+
+This is a kernel-side property, not a klug bug, and it is tracked on the agnos
+side (`docs/development/state.md`, and the `run /bin/klug > /f.txt` note at
+`kernel/core/syscall.cyr:442`). `klug --help` repeats the warning on AGNOS builds.
+
 ## License
 
 GPL-3.0-only.

@@ -45,6 +45,32 @@ fn klug_usage(): i64 {
     println("  -h, --help   this help");
     println("");
     println("filter further with the shell: klug | grep <pattern>");
+    # ⚠ AGNOS ONLY — reading the log CONSUMES it, unless you redirect. fd 1 is a
+    # VFS_DEVICE, so klug's own write(1,…) lands in vfs_write's device arm →
+    # dev_write → serial_dev_write (core/devs.cyr) → kprint → klug_append: every
+    # console-bound ring-3 byte is appended to the very ring klug#36 just read.
+    # The dump is up to KLUG_RING_BYTES and the ring is exactly KLUG_RING_BYTES,
+    # so a console dump re-appends the whole log to itself; while the ring is
+    # still short of full (a ~20 KB boot log) that DOUBLES it, and the second
+    # dump wraps and takes the boot head with it. Redirecting is not a nicety —
+    # it is how the log survives being read. A pipe is safe for the same reason
+    # the redirect is: a pipe fd takes vfs_write's VFS_PIPE arm, never kprint, so
+    # only grep's matched lines are console-bound.
+    # ⛔ Do NOT drop this note when the kernel-side fix lands — suppressing the
+    # tap for klug#36's own output fixes THIS tool, not the property (any large
+    # console dump still ages the ring), and klug ships as a committed binary
+    # that is staged onto older kernels by agnos/scripts/burn/stage-tools.sh.
+    # Tracked agnos-side: docs/development/state.md OPEN, roadmap.md (HID row),
+    # and the `run /bin/klug > /f.txt` note at core/syscall.cyr:442-444.
+    #ifdef CYRIUS_TARGET_AGNOS
+    println("");
+    println("on AGNOS, redirect instead of dumping to the console:");
+    println("      run /bin/klug > /klug.txt");
+    println("  the console write path feeds the klug ring, so dumping the log to");
+    println("  the console re-appends the dump to the log and ages the oldest boot");
+    println("  lines out. Piping is safe: klug | grep writes into the pipe, and");
+    println("  only the matched lines reach the console.");
+    #endif
     return 0;
 }
 

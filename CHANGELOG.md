@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`klug --help` now warns, on AGNOS builds only, that dumping the log to the console consumes
+  the log — redirect instead (`run /bin/klug > /klug.txt`).** fd 1 is a `VFS_DEVICE`, so klug's own
+  `write(1, …)` takes `vfs_write`'s device arm → `dev_write` → `serial_dev_write` (agnos
+  `core/devs.cyr`) → `kprint` → `klug_append`: every console-bound ring-3 byte is appended to the
+  very ring `klug`#36 just read. The dump is up to `KLUG_RING_BYTES` and the kernel ring is exactly
+  `KLUG_RING_BYTES`, so a console dump re-appends the whole log to itself — and while the ring is
+  still short of full (a ~20 KB iron boot log) that *doubles* it, so the second dump wraps and takes
+  the boot head with it. That is the one thing you were reading the log to find. A pipe is safe for
+  the same reason the redirect is: a pipe fd takes `vfs_write`'s `VFS_PIPE` arm and never reaches
+  `kprint`, so only grep's matched lines are console-bound — `klug | grep <pattern>`, which the help
+  text has always recommended, was never the hazard; the bare dump is. Documented in `README.md`
+  under a new "On AGNOS: redirect, don't dump" section.
+
+  ⚠ The note is gated `#ifdef CYRIUS_TARGET_AGNOS`, so the Linux dev-host build is **byte-identical**
+  to 0.1.4's — the hazard is a property of the agnos console path and has no meaning against
+  `/dev/kmsg`. Only `build/klug_agnos` changes.
+
+  ⛔ This is a *warning*, not a fix, and it is deliberately not a substitute for one. The kernel
+  could suppress the tap while `klug`#36's own output is being written; that is tracked agnos-side
+  (`docs/development/state.md` OPEN, `roadmap.md`, and the `run /bin/klug > /f.txt` note already
+  standing at `kernel/core/syscall.cyr:442-444`). Such a fix would settle *this tool*, not the
+  property — any large console dump still ages the ring — and klug ships as a committed binary that
+  `agnos/scripts/burn/stage-tools.sh` stages onto whatever kernel is on the box, including older
+  ones. The comment above the block in `src/klug.cyr` says so, so the note is not dropped on the
+  assumption that the kernel fix covers it.
+
 ## [0.1.4] — 2026-08-25 (cyrius 6.5.35, lib resync, CI unbreak)
 
 ### Fixed
