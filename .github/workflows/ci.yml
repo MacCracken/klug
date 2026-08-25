@@ -20,27 +20,37 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep 'cyrius *= *"' cyrius.cyml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')}"
+          set -e
+          # The cyrius.cyml [package].cyrius pin is the single source of truth.
+          #
+          # Use the UPSTREAM installer, not a hand-rolled untar. Since cyrius
+          # 6.5.24 every verb resolves the manifest pin against
+          # $CYRIUS_HOME/versions/<pin>/lib and hard-errors if that path is
+          # absent. The old recipe here flattened the tarball into
+          # $HOME/.cyrius/{bin,lib} with no versions/ dir, so at the 6.5.35 pin
+          # `cyrius build` dies with "pins version 6.5.35 but it is not
+          # installed" before compiling anything. install.sh lays out
+          # versions/<ver>/{bin,lib} + the `current` file, and verifies the
+          # release SHA-256. Matches patra + abaco.
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
           echo "Installing Cyrius $CYRIUS_VERSION"
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
-          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
-          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
 
       - name: Build
+        # klug is agnos-first, so gate BOTH targets here rather than discovering
+        # an --agnos break only at tag time in release.yml: the host build is
+        # dev-host dogfooding (/dev/kmsg), the agnos build is the real reader
+        # (klug#36) that gets staged onto the agnos-fs /bin.
         run: |
           mkdir -p build
           cyrius build src/main.cyr build/klug
+          cyrius build --agnos src/main.cyr build/klug_agnos
 
       - name: Test
-        # Explicit .tcyr path (matches patra + the other AGNOS-tic tools) — the
-        # version-stable form across the 6.0.x line. Bare `cyrius test` stopped
-        # auto-discovering .tcyr, and the `cyrius tests` discovery subcommand only
-        # exists in cyrius AFTER 6.0.56 (the pin), so the pinned CI toolchain
-        # rejects it. `cyrius test <file.tcyr>` works on every 6.0.x.
+        # Explicit .tcyr path (matches patra + the other AGNOS-tic tools).
+        # `cyrius tests` would also work at this pin — it discovers .tcyr under
+        # tests/ recursively since 6.4.72 — but naming the file keeps the gate
+        # pinned to the one suite this repo has.
         run: cyrius test tests/klug.tcyr

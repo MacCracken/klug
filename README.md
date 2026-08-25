@@ -4,7 +4,7 @@
 
 klug is the *Kernel Logs Unified Grep* subsystem. The **kernel half** (the agnos
 kernel's `core/klug.cyr`) unifies every line of kernel output — boot messages,
-driver logs, leveled `klog_info`/`warn`/`err` — into one 16 KB ring buffer. This
+driver logs, leveled `klug_info`/`warn`/`err` — into one 64 KB ring buffer. This
 **userland half** is the binary that dumps that ring to stdout.
 
 The "grep" in the name is deliberate: klug *unifies and dumps*; filtering stays
@@ -19,8 +19,8 @@ klug | grep panic     # filter — grep is the agnsh builtin
 
 ## How it works
 
-- **AGNOS** (native): the `klog`#36 syscall copies the kernel's klug ring into a
-  16 KB buffer (oldest→newest; a smaller buffer would get the newest-N tail), and
+- **AGNOS** (native): the `klug`#36 syscall copies the kernel's klug ring into a
+  64 KB buffer (oldest→newest; a smaller buffer would get the newest-N tail), and
   klug writes it to stdout. The syscall only ever copies the log ring, never other
   kernel memory.
 - **Linux** (dev-host dogfooding): reads `/dev/kmsg` so the tool runs and is
@@ -33,11 +33,11 @@ emits; unprefixed lines (boot output, raw `kprintln`) always show.
 
 ```sh
 cyrius build src/main.cyr build/klug          # host (Linux, /dev/kmsg)
-cyrius build --agnos src/main.cyr build/klug_agnos   # AGNOS (klog#36)
+cyrius build --agnos src/main.cyr build/klug_agnos   # AGNOS (klug#36)
 cyrius test tests/klug.tcyr                    # tests
 ```
 
-On AGNOS, klug is staged onto the agnos-fs `/bin` via `agnos/scripts/stage-tools.sh`
+On AGNOS, klug is staged onto the agnos-fs `/bin` via `agnos/scripts/burn/stage-tools.sh`
 and run through the shell's exec-from-disk path.
 
 ## License

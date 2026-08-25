@@ -1,7 +1,7 @@
 # klug.cyr — the klug reader: kernel-log dump + optional severity lens.
 #
 # klug is the *Kernel Logs Unified Grep* subsystem. The kernel half (the agnos
-# kernel's `core/klug.cyr`) unifies every line of kernel output into one 16 KB
+# kernel's `core/klug.cyr`) unifies every line of kernel output into one 64 KB
 # ring buffer; this is the userland half — a sovereign `dmesg` that copies that
 # ring to stdout. Filtering past the severity lens stays the shell's job:
 # `klug | grep panic`. The kernel UNIFIES, GREP stays userland.
@@ -11,7 +11,7 @@
 # module uses (syscalls / io / string) are included by main.cyr and the harness
 # before this file, per the project-include convention.
 
-# The agnos klug ring is 16 KB. `klog`#36 fills up to this many bytes (oldest→
+# The agnos klug ring is 64 KB. `klug`#36 fills up to this many bytes (oldest→
 # newest; a smaller buffer would get the newest-N tail, but we always pass the
 # full ring size so one read drains it all).
 var KLUG_RING_BYTES = 65536;
@@ -21,7 +21,7 @@ var KLUG_LVL_ALL  = 0;   # show everything (default)
 var KLUG_LVL_WARN = 1;   # warnings + errors
 var KLUG_LVL_ERR  = 2;   # errors only
 
-# The kernel's klog_info/klog_warn/klog_err prefix lines with "[I] " / "[W] " /
+# The kernel's klug_info/klug_warn/klug_err prefix lines with "[I] " / "[W] " /
 # "[E] " (see core/klug.cyr). Return the severity of a line beginning at `p`
 # (length `len`): 2=err, 1=warn, 0=info/plain. Lines without a recognized prefix
 # are level 0 — always shown (boot lines, raw kprintln output, etc.).
@@ -54,20 +54,24 @@ fn klug_usage(): i64 {
 fn klug_dump(min_level, buf): i64 {
     var n = 0;
     #ifdef CYRIUS_TARGET_AGNOS
-    # Native: klog#36 copies the klug ring into buf and returns bytes written. It
+    # Native: klug#36 copies the klug ring into buf and returns bytes written. It
     # only ever copies klug_buf, never other kernel memory, so it can't leak.
-    n = syscall(36, buf, KLUG_RING_BYTES);
+    n = sys_klug(buf, KLUG_RING_BYTES);
     if (n < 0) { println("klug: kernel log read failed"); return 1; }
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     # Dev-host dogfooding: the klug ring is agnos-only, so dump the Linux kernel
-    # ring via /dev/kmsg (world-readable on modern Linux). O_RDONLY|O_NONBLOCK so
-    # read returns once the buffer is drained (EAGAIN) instead of blocking for
-    # future messages; one record per read, accumulated into buf up to capacity.
+    # ring via /dev/kmsg. The node is mode 0644, but `kernel.dmesg_restrict=1` (the
+    # default on systemd distros) makes open() return EPERM for non-root anyway, so
+    # an unprivileged run normally lands in the branch below — that is the host
+    # policy, not a klug failure. O_RDONLY|O_NONBLOCK so read returns once the
+    # buffer is drained (EAGAIN) instead of blocking for future messages; one
+    # record per read, accumulated into buf up to capacity.
     var fd = syscall(SYS_OPEN, "/dev/kmsg", 2048, 0);   # 2048 = O_NONBLOCK (0o4000)
     if (fd < 0) {
         println("klug: kernel log unavailable on this host (open /dev/kmsg failed);");
-        println("      the native reader is agnos klog#36 — build with `cyrius build --agnos`.");
+        println("      needs root, or kernel.dmesg_restrict=0.");
+        println("      the native reader is agnos klug#36 — build with `cyrius build --agnos`.");
         return 1;
     }
     var off = 0;

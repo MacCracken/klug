@@ -1,11 +1,11 @@
 # klug test suite — the severity lens.
 #
-# klug's dump path is thin syscall I/O (klog#36 → stdout on agnos, /dev/kmsg on
+# klug's dump path is thin syscall I/O (klug#36 → stdout on agnos, /dev/kmsg on
 # the dev host) and is integration-tested via the agnos exec path (`run /bin/klug`
 # on a booted kernel — see the agnos iron tracker, item H5). The pure,
 # host-testable logic is `klug_level_of`, the lens that decides whether a line
 # passes -w/-e; this harness pins it against the kernel's "[I] " / "[W] " /
-# "[E] " prefix contract (core/klug.cyr's klog_info/warn/err).
+# "[E] " prefix contract (core/klug.cyr's klug_info/warn/err).
 
 include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
@@ -44,7 +44,7 @@ fn test_severity_ordering() {
 
 fn test_ring_size_matches_kernel() {
     # klug_buf in main.cyr (var[8192] = 65536 B) must equal the kernel ring
-    # (core/klug.cyr) so a single klog#36 read drains it. Pin the contract.
+    # (core/klug.cyr) so a single klug#36 read drains it. Pin the contract.
     # Bumped 16 KB -> 64 KB: the iron boot log (GPU arc + full device enum + SMP)
     # grew past 16 KB, so the old ring wrapped and lost the earliest boot lines.
     assert(KLUG_RING_BYTES == 65536, "ring buffer = 64 KB (kernel klug_buf)");
