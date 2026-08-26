@@ -10,8 +10,8 @@ include "lib/args.cyr"
 include "src/klug.cyr"
 
 # 64 KB read buffer matching the kernel ring. A module-global `var X[N]`
-# allocates N×u64, so var[8192] = 65536 bytes = KLUG_RING_BYTES (64 KB, matches the kernel ring).
-var klug_buf[8192];
+# allocates N×u64, so var[KLUG_RING_WORDS] (8192) = 65536 bytes = KLUG_RING_BYTES (matches the kernel ring).
+var klug_buf[KLUG_RING_WORDS];
 
 fn main(): i64 {
     args_init();
@@ -20,12 +20,22 @@ fn main(): i64 {
     var i = 1;
     while (i < ac) {
         var a = argv(i);
+        var known = 0;
         if (streq(a, "-h") == 1)     { return klug_usage(); }
         if (streq(a, "--help") == 1) { return klug_usage(); }
-        if (streq(a, "-e") == 1)     { min_level = KLUG_LVL_ERR; }
-        if (streq(a, "--err") == 1)  { min_level = KLUG_LVL_ERR; }
-        if (streq(a, "-w") == 1)     { min_level = KLUG_LVL_WARN; }
-        if (streq(a, "--warn") == 1) { min_level = KLUG_LVL_WARN; }
+        if (streq(a, "-e") == 1)     { min_level = KLUG_LVL_ERR;  known = 1; }
+        if (streq(a, "--err") == 1)  { min_level = KLUG_LVL_ERR;  known = 1; }
+        if (streq(a, "-w") == 1)     { min_level = KLUG_LVL_WARN; known = 1; }
+        if (streq(a, "--warn") == 1) { min_level = KLUG_LVL_WARN; known = 1; }
+        # Reject rather than ignore. A mistyped filter used to fall through to the
+        # UNFILTERED dump — which on agnos is the console dump that eats the ring
+        # (see klug_usage). Failing loudly is the safe default for a tool you reach
+        # for when the box is already sick. Exit 2 = usage error, distinct from the
+        # exit 1 that means "read or write failed".
+        if (known == 0) {
+            klug_err_line("klug: unknown option (see: klug --help)");
+            return 2;
+        }
         i = i + 1;
     }
     return klug_dump(min_level, &klug_buf);

@@ -27,7 +27,14 @@ klug | grep panic     # filter — grep is the agnsh builtin
   testable off-target.
 
 The severity lens (`-w`/`-e`) keys off the `[I]`/`[W]`/`[E]` prefixes the kernel
-emits; unprefixed lines (boot output, raw `kprintln`) always show.
+emits. Unprefixed lines — boot output and raw `kprintln`, which is most of an AGNOS
+boot log — are level 0, the same as `[I]`: they appear in the default dump, but
+`-w`/`-e` drop them. A panic banner emitted by raw `kprintln` carries no prefix, so
+hunt one with `klug | grep -i panic`, not `klug -e`.
+
+Every `/dev/kmsg` record on the Linux dev-host path is unprefixed (they are wire
+records, `PRI,SEQ,TS,FLAG;msg`), so `-w`/`-e` print nothing there — the lens is an
+AGNOS feature, and the host build exists to exercise the dump path, not the lens.
 
 ## Build
 
@@ -45,7 +52,7 @@ and run through the shell's exec-from-disk path.
 **Reading the log on the console consumes the log.** Redirect it:
 
 ```sh
-run /bin/klug > /klug.txt     # do this
+run /bin/klug > /f.txt        # do this
 run /bin/klug                 # this eats the boot log
 ```
 

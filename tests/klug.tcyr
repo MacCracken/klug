@@ -48,6 +48,11 @@ fn test_ring_size_matches_kernel() {
     # Bumped 16 KB -> 64 KB: the iron boot log (GPU arc + full device enum + SMP)
     # grew past 16 KB, so the old ring wrapped and lost the earliest boot lines.
     assert(KLUG_RING_BYTES == 65536, "ring buffer = 64 KB (kernel klug_buf)");
+    # The other leg of the contract. main.cyr declares `var klug_buf[KLUG_RING_WORDS]`
+    # and a var[N] is N×u64, so this pins the BUFFER's byte size to the count we hand
+    # klug#36 / read(). The harness cannot see klug_buf itself — it includes klug.cyr,
+    # not main.cyr — so the shared enum is what makes the check expressible at all.
+    assert(KLUG_RING_WORDS * 8 == KLUG_RING_BYTES, "klug_buf bytes = KLUG_RING_BYTES");
     return 0;
 }
 

@@ -7,10 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-08-25 (P-1 hardening sweep)
+
+A priority-1 audit/refactor/hardening/optimization/security sweep. No new features. Every behavioural
+change below was checked against 0.1.4 with a 2000-case differential fuzz (random prefixes, adversarial
+lengths, unterminated tails, newline-free buffers, every valid flag): **byte-for-byte identical output
+and exit codes in every case that was already correct.**
+
+### Fixed
+
+- **`write(2)`'s return value was discarded at all three write sites, so a dump could be silently
+  truncated while klug reported success.** This is the release. A single `write(1, buf, 65536)` is not
+  a promise of 65536 bytes, and on the primary target it is very far from one: agnos `pipe_write`
+  (`kernel/core/vfs.cyr`) refuses past `PIPE_RING = 4080` and returns a **short count on purpose** —
+  its own comment reads *"a short return is the contract — the caller sees fewer bytes accepted than
+  offered and can act on it. Silence cannot be acted on."* klug never looped, so
+  `run /bin/klug | grep panic` — the invocation klug's own `--help` and README advertise as the safe
+  one — delivered at most **4080 bytes of a 20–64 KB log** and exited 0. Since `klug`#36 returns the
+  ring oldest→newest, a panic line is necessarily among the newest, so it was exactly the thing
+  guaranteed to be dropped. Measured on a booted AGNOS kernel in QEMU with the shipped 0.1.4 binary.
+  The same hole hit `run /bin/klug > /f.txt` on a full disk (`ext2_write_at` returns a partial count
+  on ENOSPC) and, on Linux, any non-blocking stdout — reproduced there at **4095 of 52500 bytes,
+  exit 0, empty stderr**.
+  All writes now go through `klug_write_all()`, which loops to completion and reports failure.
+  A zero return means different things on the two targets and is handled separately: on agnos it is
+  backpressure from a pipe ring whose consumer has not been scheduled yet, so klug yields
+  (`sys_sched_yield`) and retries under a bounded stall counter — an unbounded retry would trade
+  truncation for a hang, because agnos gives the writer no reader-gone signal; on Linux it is
+  pathological and fails. A short/failed dump now exits 1 with
+  `klug: stdout write failed — the dump is INCOMPLETE` on **stderr**.
+  ⚠ The agnos *console* arm was never affected: `serial_dev_write` chunks internally and returns the
+  full count — it was rewritten precisely because of this bug. The kernel worked around klug on that
+  one arm; the pipe and ext2 arms were left, and klug never grew the loop.
+- **`--help` told operators to redirect onto `/klug.txt`, which is the kernel's reserved crash-spill
+  file.** agnos `kernel/core/klug.cyr:172` hardcodes `/klug.txt` in `klug_spill_prepare()`, called at
+  boot from `main.cyr:875`, which pre-allocates all 16 blocks at mount time so a post-mortem spill is
+  a pure overwrite-in-place and never has to run the allocator with the console dead. Redirecting a
+  short dump over it truncates the file and frees that preallocation. Worse on a latch-blocked
+  recovery boot: `klug_spill_prepare()` deliberately targets `/klug-2.txt` there and never re-prepares
+  `/klug.txt`, so the damage is not repaired by the next boot. klug was the **only** thing in the
+  ecosystem naming that file — the agnos kernel, its docs and its CHANGELOG all say `/f.txt`, and
+  klug's own README already cited `/f.txt` two lines away from printing `/klug.txt`. Now `/f.txt`
+  everywhere.
+- **Diagnostics were printed to stdout**, so they landed inside `klug > f.txt` and were piped into
+  `klug | grep` — on a tool whose entire idiom is `klug | grep`. `println` (`lib/string.cyr`) writes
+  to fd 1. All error prose now goes to fd 2 via `klug_err_line()`; `--help` stays on stdout, being
+  output rather than an error.
+- **An unknown flag was silently ignored and fell through to the unfiltered dump.** `klug --nonsence`
+  was not a typo that got caught, it was the full console dump — which on agnos is the one that eats
+  the ring. Unknown options now write to stderr and exit **2** (distinct from the exit 1 that means a
+  read or write failed).
+- **The docs claimed unprefixed lines "always show"; `-w`/`-e` drop them** — on agnos too, not just on
+  the dev host. The gate is `level >= min_level` and unprefixed is level 0, so a raw `kprintln` panic
+  banner is invisible under `klug -e`. `klug_level_of`'s contract is unchanged (it is coherent, and
+  changing it would break `-e` = "only errors"); the comment, the README and the test name now
+  describe what it actually does, and point at `klug | grep -i panic` for unprefixed banners. The
+  README also now says that every `/dev/kmsg` record is unprefixed wire format (`PRI,SEQ,TS,FLAG;msg`),
+  so `-w`/`-e` print nothing on the Linux host — the lens is an AGNOS feature.
+- **`cyrius build --aarch64` failed outright**: `undefined variable 'SYS_OPEN'`. aarch64 Linux has no
+  bare `open(2)`, so its syscall peer defines only `SYS_OPENAT` plus a portable `sys_open` wrapper.
+  klug reached around the stdlib's arch selector with a raw `syscall(SYS_OPEN, …)`; it now calls
+  `sys_open`, which is byte-identical on x86_64 (the x86_64 wrapper is literally that call). All four
+  targets — host, `--agnos`, `--aarch64`, `--win` — now build, and the aarch64 binary was verified
+  running correctly under `qemu-aarch64`. ⚠ The call is portable only where it sits: the *agnos* peer
+  defines an unrelated three-argument `sys_open(name, namelen, flags)`, so this must stay inside its
+  `#ifndef CYRIUS_TARGET_AGNOS` block, where it would otherwise compile silently and wrongly.
+
+### Changed
+
+- **The filtered path (`-w`/`-e`) coalesces adjacent passing lines into one write.** It previously
+  issued one `write(2)` per emitted line. Adjacent passing lines are contiguous in the buffer, so a run
+  is now held open and flushed when a dropped line or the end breaks it. Measured on a full ring of
+  passing lines: **1500 writes → 1**. On agnos each of those writes took `fs_spin_lock` and drove a
+  full `ext2_get_inode` → read-modify-write → `ext2_put_inode` round trip to the device, so the
+  documented `klug -w > /f.txt` was thousands of block-device operations instead of a handful. Output
+  is byte-for-byte unchanged (2000-case fuzz, plus explicit adjacent-run and unterminated-tail cases).
+- **`klug_buf`'s size and `KLUG_RING_BYTES` can no longer drift apart.** The two were independent
+  literals in different files, and the "ring-size contract" test pinned only one of them — shrinking
+  the buffer 8× still passed 11/11, because `cyrius test` never compiles `src/main.cyr` and the harness
+  cannot see `klug_buf` at all. A shared `enum KlugRing { KLUG_RING_WORDS = 8192; }` in `src/klug.cyr`
+  now *is* the buffer's extent (`var klug_buf[KLUG_RING_WORDS]`), and a 12th assertion cross-checks
+  `KLUG_RING_WORDS * 8 == KLUG_RING_BYTES`. The same sabotage now fails the suite. `KLUG_RING_BYTES`
+  stays an independent literal on purpose — the check only has teeth while the two are stated
+  separately. (`sizeof` cannot express this: cyrius's `sizeof` takes a type, not a variable.)
+
+### Deliberately not done
+
+Each of these was investigated, reproduced, and rejected with a reason — recorded so they are not
+re-proposed:
+
+- **Parsing the `/dev/kmsg` PRI field** to make `-w`/`-e` work on the Linux host. Implemented and
+  measured: it *kills the agnos lens*, because `'['` (91) > `'9'` (57), so every prefixed line falls to
+  level 0 and both `-w` and `-e` emit nothing on the target klug exists for. It also splits kmsg
+  continuation lines from their parent record. That is feature work for a path the source itself calls
+  dogfooding, not P-1 hardening.
+- **Retaining the newest 64 KB on the host path** instead of the oldest. Implemented against a FUSE
+  emulator of real `devkmsg_read` semantics: a **verified no-op**. Once the contiguous remainder is
+  shorter than the next record, `read()` returns `-EINVAL` having *already consumed* it, so any scheme
+  handing `read()` a shrinking count silently eats a record per buffer boundary. The premise was also
+  wrong — agnos returns the whole ring (klug passes the full ring size, so `klug`#36's newest-N branch
+  is dead code from this call site), so host and target do not in fact disagree.
+- **Retrying the `/dev/kmsg` drain on `-EPIPE`.** The trigger needs >2000 printk records inside a ~1–3 ms
+  drain window; and the proposed exit-code change regressed every ordinary large-log dump to exit 1.
+- **Heap-allocating `klug_buf`** to halve the binary. It works (−65536 bytes) but replaces an infallible
+  static buffer with a fallible 2 MB agnos mmap and adds a `sys_mmap` runtime dependency to a binary
+  deliberately staged onto *older* kernels. Trading an infallible read path for a new OOM failure mode
+  in the tool you reach for when the machine is sick is backwards. The underlying 64 KB of file-backed
+  `.bss` is a cyrius ELF-writer artifact (`.rodata` is placed above `.bss` in the same RW `PT_LOAD`, so
+  `p_filesz` spans the NOBITS window) affecting every cyrius binary, not a klug defect — and it costs
+  ~320 bytes in the packed git object, not 64 KB.
+- **Dropping `"assert"` from `[deps].stdlib`.** Saves 4224 bytes on agnos, but ~4096 of that is a
+  one-time page-alignment artifact that the next KB of code takes back, and it drops `lib/assert.cyr`
+  out of the `cyrius lib sync` closure so it silently freezes at the current pin — the exact stale-`lib/`
+  failure mode 0.1.4 existed to fix.
+
 ### Added
 
 - **`klug --help` now warns, on AGNOS builds only, that dumping the log to the console consumes
-  the log — redirect instead (`run /bin/klug > /klug.txt`).** fd 1 is a `VFS_DEVICE`, so klug's own
+  the log — redirect instead (`run /bin/klug > /f.txt`).** fd 1 is a `VFS_DEVICE`, so klug's own
   `write(1, …)` takes `vfs_write`'s device arm → `dev_write` → `serial_dev_write` (agnos
   `core/devs.cyr`) → `kprint` → `klug_append`: every console-bound ring-3 byte is appended to the
   very ring `klug`#36 just read. The dump is up to `KLUG_RING_BYTES` and the kernel ring is exactly
@@ -22,9 +136,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text has always recommended, was never the hazard; the bare dump is. Documented in `README.md`
   under a new "On AGNOS: redirect, don't dump" section.
 
-  ⚠ The note is gated `#ifdef CYRIUS_TARGET_AGNOS`, so the Linux dev-host build is **byte-identical**
-  to 0.1.4's — the hazard is a property of the agnos console path and has no meaning against
-  `/dev/kmsg`. Only `build/klug_agnos` changes.
+  ⚠ The note itself is gated `#ifdef CYRIUS_TARGET_AGNOS` — the hazard is a property of the agnos
+  console path and has no meaning against `/dev/kmsg`, so this entry alone changes only
+  `build/klug_agnos`. (When it landed it left the host build byte-identical to 0.1.4's; the rest of
+  0.1.5 changes both binaries, so that no longer holds for the release as a whole.)
 
   ⛔ This is a *warning*, not a fix, and it is deliberately not a substitute for one. The kernel
   could suppress the tap while `klug`#36's own output is being written; that is tracked agnos-side

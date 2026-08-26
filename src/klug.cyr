@@ -11,9 +11,17 @@
 # module uses (syscalls / io / string) are included by main.cyr and the harness
 # before this file, per the project-include convention.
 
+# main.cyr declares `var klug_buf[KLUG_RING_WORDS]`, so this enum IS the buffer's
+# extent. A `var X[N]` is N×u64, so the buffer size and the byte count below can no
+# longer drift apart silently — and the harness (which includes this file but not
+# main.cyr, and so cannot see klug_buf at all) can cross-check the two.
+enum KlugRing { KLUG_RING_WORDS = 8192; }   # ×u64 = 65536 B
+
 # The agnos klug ring is 64 KB. `klug`#36 fills up to this many bytes (oldest→
 # newest; a smaller buffer would get the newest-N tail, but we always pass the
-# full ring size so one read drains it all).
+# full ring size so one read drains it all). Kept as an independent literal on
+# purpose: the cross-check in tests/klug.tcyr only has teeth while this and
+# KLUG_RING_WORDS are stated separately.
 var KLUG_RING_BYTES = 65536;
 
 # Minimum-severity filter, ascending.
@@ -24,7 +32,10 @@ var KLUG_LVL_ERR  = 2;   # errors only
 # The kernel's klug_info/klug_warn/klug_err prefix lines with "[I] " / "[W] " /
 # "[E] " (see core/klug.cyr). Return the severity of a line beginning at `p`
 # (length `len`): 2=err, 1=warn, 0=info/plain. Lines without a recognized prefix
-# are level 0 — always shown (boot lines, raw kprintln output, etc.).
+# (boot lines, raw kprintln output) are level 0, exactly like "[I] ": they appear
+# in the default dump, but -w/-e DROP them, because the gate is level >= min_level.
+# That holds on agnos too — a raw kprintln panic banner carries no prefix, so hunt
+# one with `klug | grep -i panic`, not `klug -e`.
 fn klug_level_of(p, len): i64 {
     if (len < 4) { return KLUG_LVL_ALL; }
     if (load8(p) != 91) { return KLUG_LVL_ALL; }       # '[' = 91
@@ -65,7 +76,7 @@ fn klug_usage(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     println("");
     println("on AGNOS, redirect instead of dumping to the console:");
-    println("      run /bin/klug > /klug.txt");
+    println("      run /bin/klug > /f.txt");
     println("  the console write path feeds the klug ring, so dumping the log to");
     println("  the console re-appends the dump to the log and ages the oldest boot");
     println("  lines out. Piping is safe: klug | grep writes into the pipe, and");
@@ -74,16 +85,72 @@ fn klug_usage(): i64 {
     return 0;
 }
 
+# -EINTR. klug installs no signal handlers, so this is belt-and-braces.
+var KLUG_EINTR = 0 - 4;
+# Bound on consecutive no-progress agnos yields before we call the consumer gone.
+var KLUG_STALL_MAX = 100000;
+
+# Write EXACTLY `len` bytes from `p` to stdout, looping over short writes.
+# Returns 0 when all `len` bytes were accepted, 1 otherwise.
+#
+# WHY THIS EXISTS: a single write(1, buf, 65536) is not a promise of 65536 bytes.
+#   · agnos `pipe_write` (kernel/core/vfs.cyr) refuses past PIPE_RING = 4080 and
+#     returns a SHORT count on purpose — "a short return is the contract". So
+#     `klug | grep panic`, the command klug's own help text calls safe, delivered
+#     at most 4080 bytes of a 20–64 KB log until this loop existed.
+#   · agnos `ext2_write_at` returns a PARTIAL count on ENOSPC, so `run /bin/klug >
+#     /f.txt` on a full disk silently kept only the head. Linux does the same.
+#   · The console arm is NOT affected: `serial_dev_write` (core/devs.cyr) chunks
+#     internally and returns the full count — it was rewritten because of this very
+#     bug, which the kernel worked around on that one arm and no other.
+# A 0 return means DIFFERENT THINGS on the two targets and must not be merged: on
+# agnos it is backpressure from a ring whose consumer has not been scheduled yet
+# (retry after a yield), on Linux it is pathological (fail).
+fn klug_write_all(p, len): i64 {
+    var w = 0;
+    var stall = 0;
+    while (w < len) {
+        var r = syscall(SYS_WRITE, 1, p + w, len - w);
+        if (r > 0) { w = w + r; stall = 0; }
+        else {
+            #ifdef CYRIUS_TARGET_AGNOS
+            # -1 is a real error (bad fd / write end closed) — stop, do not spin.
+            if (r < 0) { return 1; }
+            # r == 0: pipe ring full. Yield so the consumer runs, and bound the
+            # stall so a vanished consumer (`klug | head`) cannot hang klug forever
+            # — agnos pipe_write gives the writer no reader-gone signal.
+            if (stall >= KLUG_STALL_MAX) { return 1; }
+            stall = stall + 1;
+            sys_sched_yield();
+            #endif
+            #ifndef CYRIUS_TARGET_AGNOS
+            if (r == 0) { return 1; }
+            if (r != KLUG_EINTR) { return 1; }   # -EINTR retries; anything else is fatal
+            #endif
+        }
+    }
+    return 0;
+}
+
+# Diagnostics go to fd 2: fd 1 carries the dump, so error prose on stdout lands
+# inside `klug > f.txt` and gets piped into `klug | grep`. On agnos a failed
+# fd-1 write is precisely the case where fd 1 cannot take more bytes anyway.
+fn klug_err_line(s: cstring): i64 {
+    syscall(SYS_WRITE, 2, s, strlen(s));
+    syscall(SYS_WRITE, 2, "\n", 1);
+    return 0;
+}
+
 # Read the kernel log into `buf` (must be KLUG_RING_BYTES bytes) and write the
 # lines at or above `min_level` to stdout. Returns 0 on success, 1 on read
-# failure.
+# failure or an incomplete write.
 fn klug_dump(min_level, buf): i64 {
     var n = 0;
     #ifdef CYRIUS_TARGET_AGNOS
     # Native: klug#36 copies the klug ring into buf and returns bytes written. It
     # only ever copies klug_buf, never other kernel memory, so it can't leak.
     n = sys_klug(buf, KLUG_RING_BYTES);
-    if (n < 0) { println("klug: kernel log read failed"); return 1; }
+    if (n < 0) { klug_err_line("klug: kernel log read failed"); return 1; }
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     # Dev-host dogfooding: the klug ring is agnos-only, so dump the Linux kernel
@@ -93,11 +160,11 @@ fn klug_dump(min_level, buf): i64 {
     # policy, not a klug failure. O_RDONLY|O_NONBLOCK so read returns once the
     # buffer is drained (EAGAIN) instead of blocking for future messages; one
     # record per read, accumulated into buf up to capacity.
-    var fd = syscall(SYS_OPEN, "/dev/kmsg", 2048, 0);   # 2048 = O_NONBLOCK (0o4000)
+    var fd = sys_open("/dev/kmsg", 2048, 0);            # 2048 = O_NONBLOCK (0o4000)
     if (fd < 0) {
-        println("klug: kernel log unavailable on this host (open /dev/kmsg failed);");
-        println("      needs root, or kernel.dmesg_restrict=0.");
-        println("      the native reader is agnos klug#36 — build with `cyrius build --agnos`.");
+        klug_err_line("klug: kernel log unavailable on this host (open /dev/kmsg failed);");
+        klug_err_line("      needs root, or kernel.dmesg_restrict=0.");
+        klug_err_line("      the native reader is agnos klug#36 — build with `cyrius build --agnos`.");
         return 1;
     }
     var off = 0;
@@ -114,27 +181,49 @@ fn klug_dump(min_level, buf): i64 {
     n = off;
     #endif
     if (n <= 0) { return 0; }
-    # Fast path: no filtering → one write of the whole ring.
+    var rc = 0;
+    # Fast path: no filtering → one write_all of the whole ring.
     if (min_level == KLUG_LVL_ALL) {
-        syscall(SYS_WRITE, 1, buf, n);
-        return 0;
+        rc = klug_write_all(buf, n);
+        if (rc != 0) { klug_err_line("klug: stdout write failed — the dump is INCOMPLETE"); }
+        return rc;
     }
-    # Filtered: emit line-by-line, dropping lines below min_level.
+    # Filtered: emit line-by-line, dropping lines below min_level. Adjacent passing
+    # lines are contiguous in buf, so they are coalesced into ONE write: a run is
+    # held open across consecutive passing lines and flushed when a dropped line
+    # (or the end) breaks it. Byte-for-byte identical output to a per-line emit,
+    # but 1 write instead of up to ~2400 — and on agnos each of those writes takes
+    # fs_spin_lock and drives a full ext2 read-modify-write to the device.
     var i = 0;
     var start = 0;
+    var run_start = 0 - 1;                              # -1 = no run open
+    var run_end = 0;
     while (i < n) {
         if (load8(buf + i) == 10) {                    # '\n' = 10
             if (klug_level_of(buf + start, i - start + 1) >= min_level) {
-                syscall(SYS_WRITE, 1, buf + start, i - start + 1);
+                if (run_start < 0) { run_start = start; }
+                run_end = i + 1;
+            } else {
+                if (run_start >= 0) {
+                    if (klug_write_all(buf + run_start, run_end - run_start) != 0) { rc = 1; }
+                    run_start = 0 - 1;
+                }
             }
             start = i + 1;
         }
-        i = i + 1;
+        if (rc != 0) { i = n; } else { i = i + 1; }
     }
-    if (start < n) {                                    # trailing partial line
-        if (klug_level_of(buf + start, n - start) >= min_level) {
-            syscall(SYS_WRITE, 1, buf + start, n - start);
+    if (rc == 0) {
+        if (start < n) {                                # trailing partial line
+            if (klug_level_of(buf + start, n - start) >= min_level) {
+                if (run_start < 0) { run_start = start; }
+                run_end = n;
+            }
+        }
+        if (run_start >= 0) {
+            if (klug_write_all(buf + run_start, run_end - run_start) != 0) { rc = 1; }
         }
     }
-    return 0;
+    if (rc != 0) { klug_err_line("klug: stdout write failed — the dump is INCOMPLETE"); }
+    return rc;
 }
