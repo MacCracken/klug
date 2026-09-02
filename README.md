@@ -32,6 +32,17 @@ boot log — are level 0, the same as `[I]`: they appear in the default dump, bu
 `-w`/`-e` drop them. A panic banner emitted by raw `kprintln` carries no prefix, so
 hunt one with `klug | grep -i panic`, not `klug -e`.
 
+⚠ **On a production AGNOS kernel there are currently NO tagged lines at all.** The kernel's
+`klug_info`/`klug_warn`/`klug_err` have three call sites and all three sit inside
+`#ifdef EXEC_SELFTEST`, which is off in every shipping build — so `-w`/`-e` legitimately match
+nothing. Since 0.1.6 klug says so on stderr rather than printing nothing and exiting 0, because
+"no warnings" and "no lens" are otherwise the same output.
+
+Since AGNOS 1.56.58 every kernel-origin line also carries a Linux-style uptime field,
+`[    4.123456] `, ahead of any severity tag. klug steps over it, so `-w`/`-e` work on prefixed
+and unprefixed logs alike. Ring-3 program output is deliberately left undecorated by the kernel,
+so it never carries the field.
+
 Every `/dev/kmsg` record on the Linux dev-host path is unprefixed (they are wire
 records, `PRI,SEQ,TS,FLAG;msg`), so `-w`/`-e` print nothing there — the lens is an
 AGNOS feature, and the host build exists to exercise the dump path, not the lens.

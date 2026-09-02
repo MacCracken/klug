@@ -63,18 +63,41 @@ fn test_tag_recognizes_all_three_levels() {
     return 0;
 }
 
-fn test_a_prepended_field_disarms_the_lens() {
-    # ⚠ REGRESSION PIN FOR A CHANGE THAT HAS NOT LANDED YET, AND THAT IS DELIBERATE.
-    # The lens is a FIXED-OFFSET test ('[' at 0, ']' at 2). The live proposal for the
-    # agnos kernel log is a Linux-style "[    4.123456] " uptime prefix; the day it
-    # lands, EVERY line here scores untagged and `-w`/`-e` go silently empty. This
-    # asserts the failure mode explicitly so it is a KNOWN, TESTED consequence rather
-    # than a surprise — and so that whoever implements the prefix has a red test
-    # telling them the lens must move with it.
-    assert(_level("[    4.123456] [W] low memory\n") == KLUG_LVL_ALL,
-           "a timestamp prefix collapses [W] to level 0 (lens is offset-fixed)");
-    assert(_tagged("[    4.123456] [W] low memory\n") == 0,
-           "a timestamp prefix makes a tagged line read as untagged");
+fn test_lens_sees_through_the_uptime_prefix() {
+    # ⭐ THE ACCEPTANCE RECORD FOR THE agnos 1.56.58 LOG PREFIX. The lens is offset-fixed ([ at byte 0,
+    # ] at byte 2), so a prepended uptime field would collapse every line to level 0 and make `klug -w`
+    # a silent no-op — nothing printed, exit 0, indistinguishable from "no warnings". agnos 1.56.58
+    # ships that prefix (kernel/core/kprint.cyr klog_build_prefix) and klug_time_prefix_len below steps
+    # over it. Do not weaken these to "either answer is fine": the whole hazard was that both answers
+    # look identical from outside.
+    assert(_level("[    4.123456] [W] low memory\n") == KLUG_LVL_WARN, "prefixed [W] -> WARN");
+    assert(_level("[    4.123456] [E] disk error\n") == KLUG_LVL_ERR, "prefixed [E] -> ERR");
+    assert(_level("[    4.123456] [I] booting\n") == KLUG_LVL_ALL, "prefixed [I] -> ALL");
+    assert(_tagged("[    4.123456] [W] low memory\n") == 1, "prefixed [W] is tagged");
+    assert(_tagged("[    4.123456] ext2: mounted\n") == 0, "prefixed plain line is NOT tagged");
+    return 0;
+}
+
+fn test_unprefixed_lines_still_work() {
+    # The prefix is OPTIONAL. Kernel lines emitted before the timebase calibrates, ring-3 output
+    # (which the kernel deliberately leaves undecorated), and every pre-1.56.58 captured log carry no
+    # prefix at all — the lens must be unchanged for them.
+    assert(_level("[W] low memory\n") == KLUG_LVL_WARN, "bare [W] still -> WARN");
+    assert(_level("[E] disk error\n") == KLUG_LVL_ERR, "bare [E] still -> ERR");
+    assert(_tagged("[E] disk error\n") == 1, "bare [E] still tagged");
+    return 0;
+}
+
+fn test_time_prefix_needs_all_four_anchors() {
+    # ⚠ Byte 0 alone would false-positive on a real level line. Each assert breaks exactly one anchor
+    # and requires the skip to decline, so a future "simplification" to a single [ test reddens here.
+    assert(klug_time_prefix_len("[    4.123456] x", 16) == 15, "well-formed prefix -> 15");
+    assert(klug_time_prefix_len("[E] disk error!!", 16) == 0, "a real [E] line is not a prefix");
+    assert(klug_time_prefix_len("(    4.123456] x", 16) == 0, "no opening bracket -> 0");
+    assert(klug_time_prefix_len("[    4X123456] x", 16) == 0, "no decimal point -> 0");
+    assert(klug_time_prefix_len("[    4.123456X x", 16) == 0, "no closing bracket -> 0");
+    assert(klug_time_prefix_len("[    4.123456]x ", 16) == 0, "no trailing space -> 0");
+    assert(klug_time_prefix_len("[    4.1234", 11) == 0, "too short -> 0");
     return 0;
 }
 
@@ -107,8 +130,10 @@ fn main(): i64 {
     test_group("klug tag presence vs level");
     test_tag_presence_is_distinct_from_level();
     test_tag_recognizes_all_three_levels();
-    test_group("klug lens is offset-fixed (prefix hazard)");
-    test_a_prepended_field_disarms_the_lens();
+    test_group("klug lens sees through the agnos uptime prefix");
+    test_lens_sees_through_the_uptime_prefix();
+    test_unprefixed_lines_still_work();
+    test_time_prefix_needs_all_four_anchors();
     test_group("klug severity ordering");
     test_severity_ordering();
     test_group("klug ring-size contract");

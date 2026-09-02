@@ -36,11 +36,41 @@ var KLUG_LVL_ERR  = 2;   # errors only
 # in the default dump, but -w/-e DROP them, because the gate is level >= min_level.
 # That holds on agnos too — a raw kprintln panic banner carries no prefix, so hunt
 # one with `klug | grep -i panic`, not `klug -e`.
+# The agnos kernel prefixes every KERNEL-ORIGIN line with a fixed-width 15-byte uptime field —
+# "[    4.123456] ", built by klog_build_prefix in kernel/core/kprint.cyr (agnos 1.56.58). Return 15
+# if `p` starts with one, else 0.
+#
+# ⛔ THIS EXISTS BECAUSE THE LENS IS OFFSET-FIXED AND THE PREFIX WOULD HAVE DISARMED IT SILENTLY.
+# klug_level_of tests byte 0 for [ and byte 2 for ]. Under a prefix, byte 0 is still [ so the first
+# guard passes, but byte 2 is a space — so EVERY line scored level 0, `klug -w` printed nothing and
+# exited 0, and that is indistinguishable from "no warnings" — a pure silent false negative, on the
+# one command an operator reaches for when something has gone wrong.
+#
+# ⚠ FOUR ANCHORS, NOT ONE. Byte 0 alone is not enough: a legitimate "[E] disk error" also starts with
+# [. Requiring the . at 6, the ] at 13 and the space at 14 pins the whole fixed-width shape, and no
+# level line can satisfy it (in "[E] dis" byte 6 is `s`). Cheap enough to run per line: four loads.
+#
+# ⚠ RING-3 OUTPUT NEVER CARRIES THIS PREFIX and must not be made to look as if it does — the kernel
+# raises klog_raw_depth around serial_dev_write so userland bytes pass through undecorated. A ring-3
+# line that happens to start with [ simply fails one of the four anchors and is treated as untagged,
+# which is correct: it has no severity.
+fn klug_time_prefix_len(p, len): i64 {
+    if (len < 15) { return 0; }
+    if (load8(p) != 91)       { return 0; }     # 91 = [
+    if (load8(p + 6) != 46)   { return 0; }     # 46 = .
+    if (load8(p + 13) != 93)  { return 0; }     # 93 = ]
+    if (load8(p + 14) != 32)  { return 0; }     # 32 = space
+    return 15;
+}
+
 fn klug_level_of(p, len): i64 {
-    if (len < 4) { return KLUG_LVL_ALL; }
-    if (load8(p) != 91) { return KLUG_LVL_ALL; }       # '[' = 91
-    if (load8(p + 2) != 93) { return KLUG_LVL_ALL; }   # ']' = 93
-    var c = load8(p + 1);
+    var toff = klug_time_prefix_len(p, len);           # step over "[    4.123456] " if present
+    var q = p + toff;
+    var qlen = len - toff;
+    if (qlen < 4) { return KLUG_LVL_ALL; }
+    if (load8(q) != 91) { return KLUG_LVL_ALL; }       # '[' = 91
+    if (load8(q + 2) != 93) { return KLUG_LVL_ALL; }   # ']' = 93
+    var c = load8(q + 1);
     if (c == 69) { return KLUG_LVL_ERR; }              # 'E' = 69
     if (c == 87) { return KLUG_LVL_WARN; }             # 'W' = 87
     return KLUG_LVL_ALL;                               # 'I' or anything else
@@ -65,10 +95,13 @@ fn klug_level_of(p, len): i64 {
 # kernel log; the day it lands, every line here scores 0. This counter is what turns
 # that from a silent false negative into a message on stderr.
 fn klug_has_level_tag(p, len): i64 {
-    if (len < 4) { return 0; }
-    if (load8(p) != 91) { return 0; }                  # '[' = 91
-    if (load8(p + 2) != 93) { return 0; }              # ']' = 93
-    var c = load8(p + 1);
+    var toff = klug_time_prefix_len(p, len);           # step over "[    4.123456] " if present
+    var q = p + toff;
+    var qlen = len - toff;
+    if (qlen < 4) { return 0; }
+    if (load8(q) != 91) { return 0; }                  # '[' = 91
+    if (load8(q + 2) != 93) { return 0; }              # ']' = 93
+    var c = load8(q + 1);
     if (c == 69) { return 1; }                         # 'E'
     if (c == 87) { return 1; }                         # 'W'
     if (c == 73) { return 1; }                         # 'I'

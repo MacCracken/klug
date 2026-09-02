@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.6] — 2026-09-02 (cyrius 6.5.41; the severity lens stops lying)
 
-Toolchain pin **6.5.35 → 6.5.41** and one behavioural fix. Tests **12 → 24**.
+Toolchain pin **6.5.35 → 6.5.41**, two behavioural fixes, and lockstep support for the agnos
+1.56.58 kernel-log timestamp. Tests **12 → 37**.
 
 ### Fixed
 
@@ -41,18 +42,29 @@ Toolchain pin **6.5.35 → 6.5.41** and one behavioural fix. Tests **12 → 24**
   `issues/2026-08-22-versioned-wrapper-does-not-pin-cycc.md`, unlanded). Before this bump, that
   combination left this repo one build away from a 6.5.41 stdlib under a 6.5.35 manifest.
 
-### Added — tests 12 → 24
+### Added — the agnos 1.56.58 uptime prefix, seen through rather than tripped over
+
+- agnos 1.56.58 prefixes every KERNEL-ORIGIN log line with a fixed-width 15-byte uptime field,
+  Linux printk shape: `[    4.123456] ` (`kernel/core/kprint.cyr`, `klog_build_prefix`).
+- ⛔ **That would have disarmed the severity lens silently.** `klug_level_of` tests byte 0 for `[`
+  and byte 2 for `]`. Under a prefix byte 0 is still `[`, so the first guard passes — but byte 2 is a
+  space, so EVERY line scored level 0 and `klug -w` printed nothing and exited 0. Same silent
+  false-negative as the untagged-corpus bug above, from the opposite direction.
+- New `klug_time_prefix_len` steps over the field. It requires **four** anchors — `[` at 0, `.` at 6,
+  `]` at 13, space at 14 — because byte 0 alone false-positives on a real `[E] disk error` line
+  (whose byte 6 is `s`, which is what declines it).
+- ⚠ **The prefix is OPTIONAL and the unprefixed path is unchanged.** Lines emitted before the kernel
+  timebase calibrates, all ring-3 output (agnos deliberately leaves userland bytes undecorated), and
+  every log captured before 1.56.58 carry no prefix; `test_unprefixed_lines_still_work` pins that.
+
+### Added — tests 12 → 37
 
 - `klug_has_level_tag` coverage: tag-presence is asserted to be **distinct from level**
   (`[I] ` scores 0 but IS tagged; `ext2: mounted` scores 0 and is NOT), all three levels, and the
   malformed cases.
-- ⚠ **A deliberate red-on-purpose pin for a change that has not landed yet.** The lens is a
-  FIXED-OFFSET test — `[` at byte 0, `]` at byte 2 — so ANY field prepended to the line disarms it
-  silently. A Linux-style `[    4.123456] ` uptime prefix is the live proposal for the agnos kernel
-  log (agnos 1.56.58); `test_a_prepended_field_disarms_the_lens` asserts that
-  `[    4.123456] [W] low memory` collapses to level 0 and reads as untagged. That makes the
-  consequence **known and tested** rather than a surprise, and gives whoever implements the prefix
-  a red test saying the lens must move with it.
+- `test_lens_sees_through_the_uptime_prefix` is the acceptance record for the agnos-side change;
+  `test_time_prefix_needs_all_four_anchors` breaks each anchor in turn, so a future "simplification"
+  down to a single `[` test reddens rather than silently mis-classifying real `[E]` lines.
 
 
 ## [0.1.5] — 2026-08-25 (P-1 hardening sweep)
