@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-09-02 (cyrius 6.5.41; the severity lens stops lying)
+
+Toolchain pin **6.5.35 → 6.5.41** and one behavioural fix. Tests **12 → 24**.
+
+### Fixed
+
+- **`klug -w` / `klug -e` reported "no warnings" on a kernel that has no severity lens at all.**
+  The agnos kernel's `klug_info`/`klug_warn`/`klug_err` have exactly **three** call sites and all
+  three sit inside `#ifdef EXEC_SELFTEST` (`kernel/core/main.cyr:2737-2739`, guarded `2589-3038`),
+  which is off in every production build. So a real boot log carries **zero** tagged lines, every
+  line scores level 0, and both filters printed nothing and exited 0 — indistinguishable from a box
+  that genuinely logged no warnings. A tool that cannot tell those two apart is worse than one
+  without the flag.
+- New `klug_has_level_tag(p, len)` answers a question `klug_level_of` **structurally cannot**: that
+  function returns `KLUG_LVL_ALL` (0) for a real `[I] ` *and* for an untagged boot line, because
+  both must appear in a bare dump. `klug_dump` now counts tagged lines and, when a filter ran
+  against zero of them, says so on **stderr**.
+- ⚠ **stdout stays byte-exact and the exit code stays 0.** The message is a statement about the
+  corpus, not a failed dump — so `klug -w | grep …` and every scripted caller are unaffected. The
+  0.1.5 differential-fuzz property (byte-for-byte identical stdout) still holds.
+
+### Changed
+
+- **cyrius toolchain pin 6.5.35 → 6.5.41**, in lockstep with agnos 1.56.58. The vendored `lib/`
+  snapshot resyncs with it (`syscalls_x86_64_agnos.cyr` gains `SYS_PROCLIST`#99 and
+  `SYS_READDIR_AT`#101, plus the 6.5.37 AGNOS peers).
+- ⛔ **On a dev box this resync happens whether you ask for it or not.** Measured 2026-09-02:
+  `cyrius build --no-deps` in this repo rewrote all five vendored `lib/*.cyr` files to the
+  **active** toolchain's stdlib, ignoring both `--no-deps` and the manifest pin — so a sibling repo
+  cannot be built at its own pin without `cyriusly use <pin>` first. Related and separately
+  confirmed: the versioned wrapper does not pin `cycc` either (cyrius
+  `issues/2026-08-22-versioned-wrapper-does-not-pin-cycc.md`, unlanded). Before this bump, that
+  combination left this repo one build away from a 6.5.41 stdlib under a 6.5.35 manifest.
+
+### Added — tests 12 → 24
+
+- `klug_has_level_tag` coverage: tag-presence is asserted to be **distinct from level**
+  (`[I] ` scores 0 but IS tagged; `ext2: mounted` scores 0 and is NOT), all three levels, and the
+  malformed cases.
+- ⚠ **A deliberate red-on-purpose pin for a change that has not landed yet.** The lens is a
+  FIXED-OFFSET test — `[` at byte 0, `]` at byte 2 — so ANY field prepended to the line disarms it
+  silently. A Linux-style `[    4.123456] ` uptime prefix is the live proposal for the agnos kernel
+  log (agnos 1.56.58); `test_a_prepended_field_disarms_the_lens` asserts that
+  `[    4.123456] [W] low memory` collapses to level 0 and reads as untagged. That makes the
+  consequence **known and tested** rather than a surprise, and gives whoever implements the prefix
+  a red test saying the lens must move with it.
+
+
 ## [0.1.5] — 2026-08-25 (P-1 hardening sweep)
 
 A priority-1 audit/refactor/hardening/optimization/security sweep. No new features. Every behavioural

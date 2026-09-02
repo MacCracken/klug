@@ -46,7 +46,7 @@ fn main(): i64 {
 # argc()/argv() read 0/null (klug 0.1.1 fixed that by switching to this bare
 # statement). 6.1.32 moved the capture to an entry-landing r15 park that precedes
 # all gvar-init code (see lib/args_agnos.cyr), so the workaround is no longer
-# required at the 6.5.35 pin — but it is still correct, and the bare form is what
+# required at the 6.5.41 pin — but it is still correct, and the bare form is what
 # the agnos exec path expects, so it stays.
 fn _agnos_entry(): i64 {
     var r = main();

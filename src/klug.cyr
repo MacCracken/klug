@@ -46,6 +46,35 @@ fn klug_level_of(p, len): i64 {
     return KLUG_LVL_ALL;                               # 'I' or anything else
 }
 
+# Does this line carry a RECOGNIZED level tag at all? Distinct from klug_level_of,
+# which cannot answer it: that fn returns KLUG_LVL_ALL (0) both for a real "[I] "
+# and for a line with no tag whatsoever, because both must appear in a bare dump.
+#
+# ⛔⛔ WHY THIS EXISTS — `-w`/`-e` COULD REPORT "NO WARNINGS" ON A KERNEL THAT HAS NO
+# LENS AT ALL, AND THAT IS THE STATE AGNOS SHIPS IN TODAY. The kernel's klug_info/
+# klug_warn/klug_err have exactly THREE call sites and all three sit inside
+# `#ifdef EXEC_SELFTEST` (agnos kernel/core/main.cyr:2737-2739, guarded 2589-3038),
+# which is off in every production build. So a real boot log contains ZERO tagged
+# lines, every line scores level 0, `klug -w` prints nothing and exits 0 — and
+# "this box logged no warnings" is indistinguishable from "this filter is a no-op".
+# A tool that cannot tell those apart is worse than one without the flag.
+#
+# ⚠ AND IT IS ABOUT TO MATTER MORE, NOT LESS. The lens is a FIXED-OFFSET test — '['
+# at byte 0, ']' at byte 2 — so ANY field prepended to the line disarms it silently.
+# A Linux-style "[    4.123456] " uptime prefix is the live proposal for the agnos
+# kernel log; the day it lands, every line here scores 0. This counter is what turns
+# that from a silent false negative into a message on stderr.
+fn klug_has_level_tag(p, len): i64 {
+    if (len < 4) { return 0; }
+    if (load8(p) != 91) { return 0; }                  # '[' = 91
+    if (load8(p + 2) != 93) { return 0; }              # ']' = 93
+    var c = load8(p + 1);
+    if (c == 69) { return 1; }                         # 'E'
+    if (c == 87) { return 1; }                         # 'W'
+    if (c == 73) { return 1; }                         # 'I'
+    return 0;
+}
+
 fn klug_usage(): i64 {
     println("klug — dump the AGNOS kernel log (the klug unified ring buffer).");
     println("");
@@ -198,8 +227,10 @@ fn klug_dump(min_level, buf): i64 {
     var start = 0;
     var run_start = 0 - 1;                              # -1 = no run open
     var run_end = 0;
+    var tagged = 0;                                     # lines carrying ANY recognized [I]/[W]/[E]
     while (i < n) {
         if (load8(buf + i) == 10) {                    # '\n' = 10
+            tagged = tagged + klug_has_level_tag(buf + start, i - start + 1);
             if (klug_level_of(buf + start, i - start + 1) >= min_level) {
                 if (run_start < 0) { run_start = start; }
                 run_end = i + 1;
@@ -215,6 +246,7 @@ fn klug_dump(min_level, buf): i64 {
     }
     if (rc == 0) {
         if (start < n) {                                # trailing partial line
+            tagged = tagged + klug_has_level_tag(buf + start, n - start);
             if (klug_level_of(buf + start, n - start) >= min_level) {
                 if (run_start < 0) { run_start = start; }
                 run_end = n;
@@ -225,5 +257,13 @@ fn klug_dump(min_level, buf): i64 {
         }
     }
     if (rc != 0) { klug_err_line("klug: stdout write failed — the dump is INCOMPLETE"); }
+    # ⛔ A FILTER THAT MATCHED NOTHING BECAUSE THERE IS NOTHING TO MATCH IS NOT "no warnings".
+    # Said on stderr, so stdout stays byte-exact for `klug -w | grep …` and the exit code stays 0
+    # (this is a diagnostic about the corpus, not a failure of the dump).
+    if (tagged == 0) {
+        klug_err_line("klug: no [I]/[W]/[E]-tagged lines in the ring — this filter matched nothing");
+        klug_err_line("      because the log carries no severity tags, NOT because there are no");
+        klug_err_line("      warnings. Use a bare `klug` (or `klug | grep -i panic`) instead.");
+    }
     return rc;
 }

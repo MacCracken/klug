@@ -35,6 +35,49 @@ fn test_unprefixed_lines_always_show() {
     return 0;
 }
 
+fn _tagged(s): i64 {
+    return klug_has_level_tag(s, strlen(s));
+}
+
+fn test_tag_presence_is_distinct_from_level() {
+    # ⛔ THE WHOLE POINT: klug_level_of CANNOT answer "was there a tag?" — it returns
+    # KLUG_LVL_ALL (0) for a real "[I] " AND for an untagged boot line, because both
+    # must appear in a bare dump. Without a separate predicate, `klug -w` printing
+    # nothing is indistinguishable from a kernel that emits no tags at all — which is
+    # exactly what agnos ships today (klug_info/warn/err are all inside #ifdef
+    # EXEC_SELFTEST). These two asserts are what make that distinction testable.
+    assert(_level("[I] booting\n") == KLUG_LVL_ALL, "info scores level 0 ...");
+    assert(_tagged("[I] booting\n") == 1, "... but IS tagged");
+    assert(_level("ext2: mounted\n") == KLUG_LVL_ALL, "plain line scores level 0 ...");
+    assert(_tagged("ext2: mounted\n") == 0, "... and is NOT tagged");
+    return 0;
+}
+
+fn test_tag_recognizes_all_three_levels() {
+    assert(_tagged("[E] disk error\n") == 1, "[E] is tagged");
+    assert(_tagged("[W] low memory\n") == 1, "[W] is tagged");
+    assert(_tagged("[I] booting\n") == 1, "[I] is tagged");
+    assert(_tagged("[X] weird\n") == 0, "unknown level char is NOT tagged");
+    assert(_tagged("[E") == 0, "no closing bracket is NOT tagged");
+    assert(_tagged("") == 0, "empty is NOT tagged");
+    return 0;
+}
+
+fn test_a_prepended_field_disarms_the_lens() {
+    # ⚠ REGRESSION PIN FOR A CHANGE THAT HAS NOT LANDED YET, AND THAT IS DELIBERATE.
+    # The lens is a FIXED-OFFSET test ('[' at 0, ']' at 2). The live proposal for the
+    # agnos kernel log is a Linux-style "[    4.123456] " uptime prefix; the day it
+    # lands, EVERY line here scores untagged and `-w`/`-e` go silently empty. This
+    # asserts the failure mode explicitly so it is a KNOWN, TESTED consequence rather
+    # than a surprise — and so that whoever implements the prefix has a red test
+    # telling them the lens must move with it.
+    assert(_level("[    4.123456] [W] low memory\n") == KLUG_LVL_ALL,
+           "a timestamp prefix collapses [W] to level 0 (lens is offset-fixed)");
+    assert(_tagged("[    4.123456] [W] low memory\n") == 0,
+           "a timestamp prefix makes a tagged line read as untagged");
+    return 0;
+}
+
 fn test_severity_ordering() {
     # The -w/-e filters rely on this ascending order.
     assert(KLUG_LVL_ALL < KLUG_LVL_WARN, "ALL < WARN");
@@ -61,6 +104,11 @@ fn main(): i64 {
     test_recognized_prefixes();
     test_group("klug severity lens — unprefixed / malformed");
     test_unprefixed_lines_always_show();
+    test_group("klug tag presence vs level");
+    test_tag_presence_is_distinct_from_level();
+    test_tag_recognizes_all_three_levels();
+    test_group("klug lens is offset-fixed (prefix hazard)");
+    test_a_prepended_field_disarms_the_lens();
     test_group("klug severity ordering");
     test_severity_ordering();
     test_group("klug ring-size contract");
