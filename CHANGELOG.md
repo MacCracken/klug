@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-09-07 (cyrius 6.6.0; the vendored stdlib stops rotting)
+
+Toolchain pin **6.5.41 → 6.6.0** and a full re-vendor of `lib/`. No `src/` changes: every line of
+klug's own code is untouched, and the entire diff is the manifest plus the vendored stdlib snapshot.
+Tests **37/37**. Host and `--agnos` targets build clean.
+
+### Fixed
+
+- ⛔ **`[deps].stdlib` was UNDER-DECLARED, which silently froze part of the vendored stdlib.**
+  It named **8** modules — `string`, `fmt`, `vec`, `alloc`, `io`, `syscalls`, `args`, `assert` — but
+  `lib/io.cyr` includes `lib/result.cyr`, and `result`, `atomic` and `fnptr` were never declared. So
+  `cyrius lib sync` skipped all three: they sat in `lib/` **vendored by accident**, with nothing
+  keeping them current across toolchain moves. Now declared, so the sync copies **23** files instead
+  of 20 and is reproducible from the manifest rather than from whatever happened to be on disk.
+- ⭐ **`result.cyr` had genuinely diverged, and it was the one that mattered.** v6.6.0 makes `Result`
+  a **value type** — `enum Result<T, E>: stack`, so `Ok(v)` / `Err(e)` return a value rather than an
+  allocation. klug carried the **v5.8.28** heap form, i.e. a stale `Result` sitting underneath a
+  6.6.0 `io.cyr` that includes it. (`: stack` shipped in v6.5.55; v6.5.67 made it safe by refusing
+  lossy binds.) `atomic.cyr` and `fnptr.cyr` happened to still match, which is exactly why an
+  accident-vendored file is dangerous: it reads as fine until one of them moves.
+
+### Changed
+
+- **Toolchain pin 6.5.41 → 6.6.0.** 0.1.6 shipped 6.5.41; an intermediate raise to 6.5.45 (alongside
+  agnos 1.56.60) never got a klug release, so this entry covers both hops.
+- **`lib/` re-vendored with `cyrius lib sync`, from the PIN.** ⚠ Deliberately not as a side effect of
+  a build: a build rewrites `lib/` to whatever toolchain is **active**, which is how a sibling ends up
+  vendoring a snapshot its own manifest never declared. All **23** `lib/*.cyr` now byte-match
+  `~/.cyrius/versions/6.6.0/lib`.
+- **The vendored agnos syscall wrapper caught up to the agnos 1.56.59/60 surface** — `SYS_MOUNTLIST`
+  (**104**, 80-byte records) with `sys_mountlist`; the four `net_config` counter accessors
+  `sys_net_tx_packets` / `sys_net_rx_packets` / `sys_net_tx_bytes` / `sys_net_rx_bytes` (fields
+  **8–11**); and a tombstone comment where `SYS_BLKSTATS = 105` used to sit — that number was minted,
+  shipped as a peer, then **withdrawn** in v6.5.45 once an extend-vs-mint audit found the counters
+  belonged in `sysinfo`#35's tail. ⛔ Do not re-add 105: the agnos kernel has no `num == 105` arm, and
+  a wrapper with no kernel arm does not error — the caller gets the dispatch fall-through and may
+  render it as a statistic.
+- **macOS/aarch64 wrappers gained the threading surface** — `sys_bsdthread_register` / `_create` /
+  `_terminate` and `sys_ulock_wait` / `sys_ulock_wake`. Not reachable from klug; carried in because
+  the snapshot is vendored whole per declared module.
+- **Both binaries shrank on identical source**: `build/klug` **134,832 → 134,816** and
+  `build/klug_agnos` **139,008 → 134,928** (−4,080 B), the compiler emitting less for the same input.
+
+
 ## [0.1.6] — 2026-09-02 (cyrius 6.5.41; the severity lens stops lying)
 
 Toolchain pin **6.5.35 → 6.5.41**, two behavioural fixes, and lockstep support for the agnos
