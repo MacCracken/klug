@@ -28,9 +28,27 @@ Tests **37/37**. Host and `--agnos` targets build clean.
   lossy binds.) `atomic.cyr` and `fnptr.cyr` happened to still match, which is exactly why an
   accident-vendored file is dangerous: it reads as fine until one of them moves.
 
+### Removed
+
+- ⛔ **`build/klug` and `build/klug_agnos` are no longer tracked**, and this repo now has a
+  `.gitignore` (it had none). agnos removed the same shape at 1.56.44 after `tests/gpu/build/edgeasm`
+  — committed, green, exiting 95 with "B4 PASS" — sat beside an `edgeasm.cyr` that **could not
+  compile at all**. A committed build artifact is not evidence about the source beside it; it is
+  evidence about whatever source existed when someone last ran a compiler, and a stale oracle does
+  not fail, it **agrees**. This release contained a live instance of that risk: `lib/result.cyr` was
+  the v5.8.28 heap-form `Result` under a 6.6.0 `io.cyr`, with a tracked, green binary beside it.
+- ⚠ **Consequence, stated rather than discovered later**: agnos `scripts/burn/stage-tools.sh:129`
+  stages this repo as a **sibling** row, and sibling rows do **not** auto-build (only in-tree
+  `agnos/*` rows do). On a fresh clone with no `build/`, stage-tools now fails with
+  `ERROR: …/build/klug_agnos not present — run with --build`. That is the intended trade: an
+  actionable error beats a fossil that stages silently and reaches iron.
+- ⚠ **`lib/` stays tracked deliberately** — it is the vendored stdlib snapshot (source, not output),
+  pinned by `[deps].stdlib` and refreshed with `cyrius lib sync`.
+
 ### Changed
 
-- **Toolchain pin 6.5.41 → 6.6.0.** 0.1.6 shipped 6.5.41; an intermediate raise to 6.5.45 (alongside
+- **Toolchain pin 6.5.41 → 6.6.0.**
+ 0.1.6 shipped 6.5.41; an intermediate raise to 6.5.45 (alongside
   agnos 1.56.60) never got a klug release, so this entry covers both hops.
 - **`lib/` re-vendored with `cyrius lib sync`, from the PIN.** ⚠ Deliberately not as a side effect of
   a build: a build rewrites `lib/` to whatever toolchain is **active**, which is how a sibling ends up

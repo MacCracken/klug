@@ -1,0 +1,28 @@
+# Build artifacts. ⛔ NEVER COMMIT THESE.
+#
+# `build/klug` and `build/klug_agnos` were TRACKED until 0.1.7. agnos removed the same shape from its
+# own tree at 1.56.44 and wrote down why: `tests/gpu/build/edgeasm` was committed at 108,784 B, and
+# running it exited 95 printing "B4 PASS -- the tool reproduces a shipped iron-proven shader
+# byte-for-byte", while `edgeasm.cyr` beside it COULD NOT COMPILE AT ALL. Anyone who verified the
+# oracle by running the binary got a green light from a fossil.
+#
+# ⇒ A committed build artifact is not evidence about the source beside it. It is evidence about
+# whatever source existed when someone last ran a compiler — and unlike a stale doc it PASSES,
+# because a stale oracle does not fail, it agrees.
+#
+# This repo had a live instance of exactly that risk: at 0.1.7 the vendored `lib/result.cyr` was the
+# v5.8.28 heap-form `Result` under a 6.6.0 `io.cyr`, while `build/klug_agnos` sat tracked and green.
+/build/
+
+# ⚠ CONSEQUENCE, RECORDED SO IT IS NOT A SURPRISE: agnos `scripts/burn/stage-tools.sh:129` stages
+# this repo (`stage_one klug src/main.cyr klug`) as a SIBLING row, and sibling rows do NOT auto-build
+# — only `agnos/*` in-tree rows do. So on a fresh clone with no `build/`, stage-tools now FAILS with
+#     ERROR: .../build/klug_agnos not present — run with --build
+# That is the intended trade: an actionable error beats a fossil that stages silently and burns to
+# iron. Run `stage-tools.sh --build`, or `cyrius build --agnos src/main.cyr build/klug_agnos` here.
+
+# ⚠ `lib/` IS TRACKED ON PURPOSE and must stay that way — it is the VENDORED stdlib snapshot, pinned
+# by `[deps].stdlib` in cyrius.cyml and refreshed with `cyrius lib sync`. It is source, not output.
+
+# cyrius dep-resolver lock file — `cyrius deps` writes it by default; nothing here reads it.
+cyrius.lock
