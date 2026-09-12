@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-11
+
+### Changed
+
+- **Toolchain `6.6.1` → `6.6.2`.** No source change; the value form needed none.
+  Build, tests, and any bench/fuzz/distlib target the repo ships re-verified at the new pin.
+
+
 ## [0.1.7] — 2026-09-07 (cyrius 6.6.0; the vendored stdlib stops rotting)
 
 Toolchain pin **6.5.41 → 6.6.0** and a full re-vendor of `lib/`. No `src/` changes: every line of
