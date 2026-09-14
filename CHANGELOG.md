@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-09-14
+
+### Changed
+
+- **Toolchain `6.6.3` → `6.6.4`**, moving with agnos 1.57.4. Vendored `lib/` re-synced from the pin
+  (23/23 byte-match). No source change; both shipped binaries **changed** this time because the
+  stdlib did: 6.6.4's `lib/io.cyr` maps `O_DIRECTORY`/`O_NOFOLLOW`/`O_EXCL` to the agnos `AO_*` bits and
+  routes `flock` through `SYS_FLOCK`, and `lib/syscalls_x86_64_agnos.cyr` gained `AO_NOFOLLOW`/`AO_EXCL`
+  (`build/klug` 134,816 → 134,864 B · `build/klug_agnos` 134,928 → 139,056 B). Tests pass at the new pin.
+
 ## [0.1.9] - 2026-09-13
 
 ### Changed
