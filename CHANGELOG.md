@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-13
+
+### Changed
+
+- **Toolchain `6.6.2` → `6.6.3`**, moving with agnos 1.57.2 (the 1.56.60 / 1.57.0 / 1.57.1 precedent).
+  Vendored `lib/` re-synced from the pin (`cyrius lib sync`, all 23 files byte-match the 6.6.3
+  snapshot). No source change; **both shipped binaries are byte-identical** to the 0.1.8 build
+  (`build/klug` 134,816 B · `build/klug_agnos` 134,928 B) — 6.6.3's codegen fixes (nested
+  `continue` binding, DCE data vaddr) touch nothing klug compiles. Tests pass at the new pin.
+
 ## [0.1.8] - 2026-09-11
 
 ### Changed
