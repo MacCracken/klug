@@ -1,14 +1,20 @@
-# klug test suite — the severity lens.
+# klug test suite — the severity lens and the write loop.
 #
 # klug's dump path is thin syscall I/O (klug#36 → stdout on agnos, /dev/kmsg on
 # the dev host) and is integration-tested via the agnos exec path (`run /bin/klug`
-# on a booted kernel — see the agnos iron tracker, item H5). The pure,
-# host-testable logic is `klug_level_of`, the lens that decides whether a line
-# passes -w/-e; this harness pins it against the kernel's "[I] " / "[W] " /
-# "[E] " prefix contract (core/klug.cyr's klug_info/warn/err).
+# on a booted kernel — see the agnos iron tracker, item H5) and, since 0.2.0, by
+# CI executing the host binary as root. What is host-testable in-process:
+#   · the ring lens, `klug_level_of(.., KLUG_SRC_RING)`, pinned against the kernel's
+#     "[I] " / "[W] " / "[E] " prefix contract (core/klug.cyr's klug_info/warn/err);
+#   · the /dev/kmsg lens, `klug_level_of(.., KLUG_SRC_KMSG)`, pinned against the
+#     dev-kmsg record format (syslog priority, continuation lines);
+#   · the write loop, `klug_write_loop`, driven through a scripted fake writer so
+#     every short-write / zero / errno arm of BOTH targets' policies runs here —
+#     including the agnos backpressure arm, which used to run only on iron.
 
 include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
+include "lib/fnptr.cyr"
 include "lib/string.cyr"
 include "lib/fmt.cyr"
 include "lib/io.cyr"
@@ -16,7 +22,7 @@ include "lib/assert.cyr"
 include "src/klug.cyr"
 
 fn _level(s): i64 {
-    return klug_level_of(s, strlen(s));
+    return klug_level_of(s, strlen(s), KLUG_SRC_RING);
 }
 
 fn test_recognized_prefixes() {
@@ -36,7 +42,7 @@ fn test_unprefixed_lines_always_show() {
 }
 
 fn _tagged(s): i64 {
-    return klug_has_level_tag(s, strlen(s));
+    return klug_has_level_tag(s, strlen(s), KLUG_SRC_RING);
 }
 
 fn test_tag_presence_is_distinct_from_level() {
@@ -122,6 +128,421 @@ fn test_ring_size_matches_kernel() {
     return 0;
 }
 
+# ── /dev/kmsg lens ───────────────────────────────────────────────────────────────
+
+fn _klevel(s): i64 {
+    return klug_level_of(s, strlen(s), KLUG_SRC_KMSG);
+}
+
+fn _ktagged(s): i64 {
+    return klug_has_level_tag(s, strlen(s), KLUG_SRC_KMSG);
+}
+
+fn _kpri(s): i64 {
+    return klug_kmsg_pri_level(s, strlen(s));
+}
+
+fn test_kmsg_priority_maps_to_level() {
+    # syslog level = pri & 7: 0 emerg · 1 alert · 2 crit · 3 err · 4 warning · 5 notice · 6 info ·
+    # 7 debug. -e keeps <= 3, -w keeps <= 4 — the same slice `dmesg --level` makes.
+    assert(_klevel("0,1,2,-;emerg\n") == KLUG_LVL_ERR, "emerg (0) -> ERR");
+    assert(_klevel("1,1,2,-;alert\n") == KLUG_LVL_ERR, "alert (1) -> ERR");
+    assert(_klevel("2,1,2,-;crit\n") == KLUG_LVL_ERR, "crit (2) -> ERR");
+    assert(_klevel("3,100,123456,-;disk error\n") == KLUG_LVL_ERR, "err (3) -> ERR");
+    assert(_klevel("4,100,123456,-;low memory\n") == KLUG_LVL_WARN, "warning (4) -> WARN");
+    assert(_klevel("5,1,2,-;notice\n") == KLUG_LVL_ALL, "notice (5) -> ALL");
+    assert(_klevel("6,339,5140900,-;NET: Registered protocol family 10\n") == KLUG_LVL_ALL, "info (6) -> ALL");
+    assert(_klevel("7,1,2,-;debug\n") == KLUG_LVL_ALL, "debug (7) -> ALL");
+    return 0;
+}
+
+fn test_kmsg_facility_bits_are_ignored() {
+    # A userspace writer to /dev/kmsg carries its facility in the high bits (user = 1<<3, local7 =
+    # 23<<3). The LEVEL is the low three bits regardless — "12," is user.warning, still a warning.
+    assert(_klevel("12,1,2,-;user.warning\n") == KLUG_LVL_WARN, "12 (user.warning) -> WARN");
+    assert(_klevel("11,1,2,-;user.err\n") == KLUG_LVL_ERR, "11 (user.err) -> ERR");
+    assert(_klevel("14,1,2,-;user.info\n") == KLUG_LVL_ALL, "14 (user.info) -> ALL");
+    assert(_klevel("188,1,2,-;local7.warning\n") == KLUG_LVL_WARN, "188 (local7.warning) -> WARN");
+    assert(_klevel("191,1,2,-;local7.debug\n") == KLUG_LVL_ALL, "191 (local7.debug) -> ALL");
+    return 0;
+}
+
+fn test_kmsg_not_a_record_is_untagged() {
+    # The primitive says -1 for anything that is not "<digits>,"; the lens turns that into ALL
+    # (shown in a bare dump, dropped by a filter) and the tag predicate into 0 — the same rule the
+    # ring applies to an untagged boot line, so the "matched nothing because nothing is tagged"
+    # note keeps working on this source.
+    assert(_kpri("") == 0 - 1, "empty -> not a record");
+    assert(_kpri("abc\n") == 0 - 1, "no leading digits -> not a record");
+    assert(_kpri("3;msg\n") == 0 - 1, "digits but no comma -> not a record");
+    assert(_kpri(",3,1,2,-;x\n") == 0 - 1, "comma first -> not a record");
+    assert(_kpri("3") == 0 - 1, "digits to the end (no comma) -> not a record");
+    assert(_kpri("12345678901,x\n") == 0 - 1, "11 digits -> not a priority");
+    assert(_kpri("1234567890,x\n") >= 0, "10 digits is still parsed (cap is 10)");
+    assert(_klevel("abc\n") == KLUG_LVL_ALL, "not a record -> ALL");
+    assert(_ktagged("abc\n") == 0, "not a record -> NOT tagged");
+    assert(_ktagged("") == 0, "empty -> NOT tagged");
+    assert(_ktagged("6,1,2,-;x\n") == 1, "an info record IS tagged (level 0, but present)");
+    assert(_ktagged("3,1,2,-;x\n") == 1, "an err record is tagged");
+    return 0;
+}
+
+fn test_kmsg_continuation_lines_inherit_their_record() {
+    # The kernel appends " KEY=VALUE" dictionary lines to dev_printk records (" SUBSYSTEM=usb",
+    # " DEVICE=+usb:1-2"). They carry no priority; per line they would score ALL and `klug -e`
+    # would strip an error's context. klug_line_level hands them the previous header's level.
+    assert(klug_line_level(" SUBSYSTEM=usb\n", 15, KLUG_SRC_KMSG, KLUG_LVL_ERR) == KLUG_LVL_ERR, "continuation after an err -> ERR");
+    assert(klug_line_level(" DEVICE=+usb:1-2\n", 17, KLUG_SRC_KMSG, KLUG_LVL_WARN) == KLUG_LVL_WARN, "continuation after a warning -> WARN");
+    assert(klug_line_level(" SUBSYSTEM=usb\n", 15, KLUG_SRC_KMSG, KLUG_LVL_ALL) == KLUG_LVL_ALL, "continuation after info -> ALL");
+    # A header never inherits: its own priority wins over whatever came before.
+    assert(klug_line_level("6,1,2,-;x\n", 10, KLUG_SRC_KMSG, KLUG_LVL_ERR) == KLUG_LVL_ALL, "info header after an err -> ALL (own priority)");
+    assert(klug_line_level("3,1,2,-;x\n", 10, KLUG_SRC_KMSG, KLUG_LVL_ALL) == KLUG_LVL_ERR, "err header after info -> ERR (own priority)");
+    # Not a record and not a continuation: plain ALL, prev is not consulted.
+    assert(klug_line_level("garbage\n", 8, KLUG_SRC_KMSG, KLUG_LVL_ERR) == KLUG_LVL_ALL, "garbage after an err -> ALL");
+    assert(klug_line_level("", 0, KLUG_SRC_KMSG, KLUG_LVL_ERR) == KLUG_LVL_ALL, "empty after an err -> ALL");
+    return 0;
+}
+
+fn test_lens_is_per_source_not_per_byte() {
+    # ⛔ THE REASON THE LENS TAKES A SOURCE. The same bytes mean different things on the two logs:
+    # "3,1,2,-;x" is an alert-level record on /dev/kmsg and a ring-3 program's CSV line on agnos.
+    # A lens that sniffed the bytes would make `klug -e` on agnos surface every program that ever
+    # printed a number and a comma. Each source applies ONLY its own rule.
+    assert(_klevel("3,1,2,-;x\n") == KLUG_LVL_ERR, "KMSG: '3,' is an err record");
+    assert(_level("3,1,2,-;x\n") == KLUG_LVL_ALL, "RING: '3,' is just a line");
+    assert(_ktagged("3,1,2,-;x\n") == 1, "KMSG: tagged");
+    assert(_tagged("3,1,2,-;x\n") == 0, "RING: NOT tagged");
+    # And the ring's tag means nothing on /dev/kmsg — a record's message is behind its header.
+    assert(_klevel("[E] disk error\n") == KLUG_LVL_ALL, "KMSG: a bare [E] line is not a record -> ALL");
+    assert(_ktagged("[E] disk error\n") == 0, "KMSG: a bare [E] line is NOT tagged");
+    assert(_level("[E] disk error\n") == KLUG_LVL_ERR, "RING: [E] -> ERR (unchanged)");
+    # A leading space is a continuation ONLY on /dev/kmsg. Ring-3 output that indents itself is
+    # not continuing the kernel line above it.
+    assert(klug_line_level("  indented ring-3 output\n", 25, KLUG_SRC_RING, KLUG_LVL_ERR) == KLUG_LVL_ALL, "RING: leading space never inherits");
+    assert(klug_line_level("[E] x\n", 6, KLUG_SRC_RING, KLUG_LVL_ALL) == KLUG_LVL_ERR, "RING: line_level is level_of");
+    assert(KLUG_SRC_RING != KLUG_SRC_KMSG, "the two sources are distinct");
+    return 0;
+}
+
+# ── write loop ───────────────────────────────────────────────────────────────────
+#
+# A scripted fake writer stands in for `write(1, …)`. Per call it returns the next scripted
+# value (a short count, 0, or a negative errno); past the end of the script it accepts
+# everything offered. Every accepted byte is copied into a sink so the test can prove the
+# loop advanced `p` and shrank `len` by exactly what was accepted — the arithmetic that,
+# if wrong, ships a dump with a hole in it and exit 0.
+
+var _wr_script[32];      # scripted return values, one per call
+var _wr_script_len = 0;
+var _wr_const_on = 0;    # 1: ignore the script, return _wr_const on EVERY call
+var _wr_const = 0;
+var _wr_calls = 0;
+var _wr_base = 0;        # the buffer the loop was handed
+var _wr_total = 0;
+var _wr_sink[128];       # accepted bytes, in order (1 KB)
+var _wr_sunk = 0;
+var _wr_bad_offer = 0;   # set if any call's (p, len) was not exactly (base + sunk, total - sunk), or len <= 0
+var _wr_strict = 1;      # 0: skip the offer check (emit tests write several sub-ranges of one log)
+var _wr_src[128];        # 1 KB source pattern
+
+fn _wr_fill(n): i64 {
+    var i = 0;
+    while (i < n) { store8(&_wr_src + i, 65 + (i % 26)); i = i + 1; }
+    return 0;
+}
+
+fn _wr_reset(total): i64 {
+    _wr_fill(total);
+    memset(&_wr_sink, 0, 1024);
+    _wr_script_len = 0; _wr_const_on = 0; _wr_const = 0; _wr_calls = 0;
+    _wr_base = &_wr_src; _wr_total = total; _wr_sunk = 0; _wr_bad_offer = 0; _wr_strict = 1;
+    return 0;
+}
+
+fn _wr_push(r): i64 {
+    store64(&_wr_script + _wr_script_len * 8, r);
+    _wr_script_len = _wr_script_len + 1;
+    return 0;
+}
+
+fn _wr_always(r): i64 {
+    _wr_const_on = 1;
+    _wr_const = r;
+    return 0;
+}
+
+fn _fake_writer(p, len): i64 {
+    if (_wr_strict == 1) {
+        if (p != _wr_base + _wr_sunk) { _wr_bad_offer = 1; }
+        if (len != _wr_total - _wr_sunk) { _wr_bad_offer = 1; }
+    }
+    if (len <= 0) { _wr_bad_offer = 1; }
+    var i = _wr_calls;
+    _wr_calls = _wr_calls + 1;
+    var r = len;                                        # past the script: accept everything
+    if (_wr_const_on == 1) { r = _wr_const; }
+    else { if (i < _wr_script_len) { r = load64(&_wr_script + i * 8); } }
+    if (r > len) { r = len; }                           # a script cannot accept more than offered
+    if (r > 0) { memcpy(&_wr_sink + _wr_sunk, p, r); _wr_sunk = _wr_sunk + r; }
+    return r;
+}
+
+fn _wr_run(mode): i64 {
+    return klug_write_loop(&_fake_writer, mode, &_wr_src, _wr_total);
+}
+
+fn _wr_delivered_all(): i64 {
+    if (_wr_sunk != _wr_total) { return 0; }
+    if (_wr_bad_offer != 0) { return 0; }
+    return memeq(&_wr_sink, &_wr_src, _wr_total);
+}
+
+fn test_write_loop_loops_over_short_writes() {
+    # The 0.1.5 bug: one write(1, buf, 65536) accepted 4080 bytes and klug exited 0. The loop
+    # must keep offering the unsent tail — at exactly the right offset — until it is all gone.
+    _wr_reset(300); _wr_push(100); _wr_push(50); _wr_push(150);
+    assert_eq(_wr_run(KLUG_WR_LINUX), 0, "linux: three short writes -> 0");
+    assert_eq(_wr_calls, 3, "linux: one call per short write");
+    assert_eq(_wr_delivered_all(), 1, "linux: every byte delivered once, in order, from the right offset");
+    _wr_reset(300); _wr_push(100); _wr_push(50); _wr_push(150);
+    assert_eq(_wr_run(KLUG_WR_AGNOS), 0, "agnos: three short writes -> 0");
+    assert_eq(_wr_calls, 3, "agnos: one call per short write");
+    assert_eq(_wr_delivered_all(), 1, "agnos: every byte delivered once, in order, from the right offset");
+    # A 4080-byte cap on a 4096-byte offer, the exact agnos pipe_write shape, scaled to the sink.
+    _wr_reset(500); _wr_push(408); _wr_push(408);
+    assert_eq(_wr_run(KLUG_WR_AGNOS), 0, "agnos: pipe-cap shape -> 0");
+    assert_eq(_wr_calls, 2, "agnos: 408 + 92 (second offer capped by the remainder)");
+    assert_eq(_wr_delivered_all(), 1, "agnos: nothing lost past the cap");
+    return 0;
+}
+
+fn test_write_loop_full_write_is_one_call() {
+    _wr_reset(300);
+    assert_eq(_wr_run(KLUG_WR_LINUX), 0, "linux: full write -> 0");
+    assert_eq(_wr_calls, 1, "linux: full write is exactly one call");
+    assert_eq(_wr_delivered_all(), 1, "linux: full write delivered");
+    return 0;
+}
+
+fn test_write_loop_zero_length_never_writes() {
+    # An empty run must not issue write(1, p, 0): the loop condition, not the writer, ends it.
+    _wr_reset(0);
+    assert_eq(_wr_run(KLUG_WR_LINUX), 0, "linux: len 0 -> 0");
+    assert_eq(_wr_calls, 0, "linux: len 0 -> no write at all");
+    _wr_reset(0);
+    assert_eq(_wr_run(KLUG_WR_AGNOS), 0, "agnos: len 0 -> 0");
+    assert_eq(_wr_calls, 0, "agnos: len 0 -> no write at all");
+    return 0;
+}
+
+fn test_write_loop_linux_eintr_retries() {
+    # -EINTR is the one negative the Linux arm retries (belt-and-braces: klug installs no
+    # handlers). The retry must re-offer the SAME tail, not skip ahead.
+    _wr_reset(300); _wr_push(100); _wr_push(KLUG_EINTR); _wr_push(KLUG_EINTR); _wr_push(200);
+    assert_eq(_wr_run(KLUG_WR_LINUX), 0, "linux: two EINTRs then progress -> 0");
+    assert_eq(_wr_calls, 4, "linux: each EINTR costs one retry");
+    assert_eq(_wr_delivered_all(), 1, "linux: EINTR retry re-offers the same tail");
+    return 0;
+}
+
+fn test_write_loop_linux_zero_is_fatal() {
+    # On Linux a 0 from write(2) on a non-empty offer is pathological — fail, do not spin.
+    _wr_reset(300); _wr_push(100); _wr_push(0);
+    assert_eq(_wr_run(KLUG_WR_LINUX), 1, "linux: 0 -> 1");
+    assert_eq(_wr_calls, 2, "linux: 0 stops the loop immediately");
+    assert_eq(_wr_sunk, 100, "linux: the partial count is what reached the fd");
+    return 0;
+}
+
+fn test_write_loop_linux_other_errno_is_fatal() {
+    # -EAGAIN (11): a non-blocking stdout (measured: 4095 of 52500 bytes, exit 0, before 0.1.5).
+    # Anything but -EINTR is fatal — and reported, which is what turns exit 0 into exit 1.
+    _wr_reset(300); _wr_push(100); _wr_push(0 - 11);
+    assert_eq(_wr_run(KLUG_WR_LINUX), 1, "linux: -EAGAIN -> 1");
+    assert_eq(_wr_calls, 2, "linux: -EAGAIN stops the loop immediately");
+    _wr_reset(300); _wr_push(0 - 32);
+    assert_eq(_wr_run(KLUG_WR_LINUX), 1, "linux: -EPIPE -> 1");
+    assert_eq(_wr_calls, 1, "linux: -EPIPE stops the loop immediately");
+    return 0;
+}
+
+fn test_write_loop_agnos_zero_is_backpressure() {
+    # On agnos a 0 is the pipe ring saying "consumer not scheduled yet": yield, re-offer the same
+    # tail, and carry on when it drains. This arm ran only on iron before 0.2.0.
+    _wr_reset(300); _wr_push(100); _wr_push(0); _wr_push(0); _wr_push(200);
+    assert_eq(_wr_run(KLUG_WR_AGNOS), 0, "agnos: two zeros then progress -> 0");
+    assert_eq(_wr_calls, 4, "agnos: each zero costs one yield + retry");
+    assert_eq(_wr_delivered_all(), 1, "agnos: the retry after backpressure re-offers the same tail");
+    return 0;
+}
+
+fn test_write_loop_agnos_negative_is_fatal() {
+    # agnos has no EINTR: any negative is a real error (bad fd / write end closed) — stop.
+    _wr_reset(300); _wr_push(100); _wr_push(0 - 1);
+    assert_eq(_wr_run(KLUG_WR_AGNOS), 1, "agnos: -1 -> 1");
+    assert_eq(_wr_calls, 2, "agnos: -1 stops the loop immediately");
+    assert_eq(_wr_sunk, 100, "agnos: the partial count is what reached the fd");
+    _wr_reset(300); _wr_push(KLUG_EINTR);
+    assert_eq(_wr_run(KLUG_WR_AGNOS), 1, "agnos: even -4 is fatal (no EINTR on agnos)");
+    assert_eq(_wr_calls, 1, "agnos: -4 stops the loop immediately");
+    return 0;
+}
+
+fn test_write_loop_agnos_stall_is_bounded() {
+    # `klug | head`: the consumer is gone, the pipe never drains, agnos gives the writer no
+    # reader-gone signal. Without the bound klug hangs forever. The bound is KLUG_STALL_MAX
+    # consecutive no-progress calls; the call that finds the counter AT the bound fails, so
+    # exactly MAX + 1 calls are made. Run at a small bound for precision ...
+    var saved = KLUG_STALL_MAX;
+    KLUG_STALL_MAX = 5;
+    _wr_reset(300); _wr_always(0);
+    assert_eq(_wr_run(KLUG_WR_AGNOS), 1, "agnos: a consumer that never drains -> 1");
+    assert_eq(_wr_calls, 6, "agnos: exactly KLUG_STALL_MAX + 1 attempts");
+    assert_eq(_wr_sunk, 0, "agnos: nothing was delivered");
+    KLUG_STALL_MAX = saved;
+    # ... and once at the SHIPPED bound, so the constant is proven finite, not just declared.
+    _wr_reset(300); _wr_always(0);
+    assert_eq(_wr_run(KLUG_WR_AGNOS), 1, "agnos: production bound terminates -> 1");
+    assert_eq(_wr_calls, KLUG_STALL_MAX + 1, "agnos: production bound is KLUG_STALL_MAX + 1 attempts");
+    return 0;
+}
+
+fn test_write_loop_agnos_stall_resets_on_progress() {
+    # The bound is on CONSECUTIVE stalls. A slow consumer that drains a little now and then must
+    # never trip it, however long the dump — only a consumer that stops draining does. With
+    # MAX = 3, three zeros are under the bound; a fourth without progress in between is not.
+    var saved = KLUG_STALL_MAX;
+    KLUG_STALL_MAX = 3;
+    _wr_reset(300);
+    _wr_push(0); _wr_push(0); _wr_push(0); _wr_push(1);
+    _wr_push(0); _wr_push(0); _wr_push(0); _wr_push(1);
+    assert_eq(_wr_run(KLUG_WR_AGNOS), 0, "agnos: 3 stalls, progress, 3 stalls, progress -> 0");
+    assert_eq(_wr_calls, 9, "agnos: 8 scripted calls + the final full write");
+    assert_eq(_wr_delivered_all(), 1, "agnos: slow consumer still gets every byte");
+    # Control: the same run with one stall too many in the second burst trips the bound.
+    _wr_reset(300);
+    _wr_push(0); _wr_push(0); _wr_push(0); _wr_push(1);
+    _wr_push(0); _wr_push(0); _wr_push(0); _wr_push(0);
+    assert_eq(_wr_run(KLUG_WR_AGNOS), 1, "agnos: a fourth consecutive stall trips the bound");
+    assert_eq(_wr_calls, 8, "agnos: tripped on the 4th stall of the second burst");
+    KLUG_STALL_MAX = saved;
+    return 0;
+}
+
+fn test_write_loop_production_constants() {
+    assert_eq(KLUG_STALL_MAX, 100000, "shipped stall bound is 100000 yields");
+    assert_eq(KLUG_EINTR, 0 - 4, "EINTR is -4");
+    assert(KLUG_WR_LINUX != KLUG_WR_AGNOS, "the two policies are distinct");
+    return 0;
+}
+
+# ── emit: the filter over a whole log, byte-exact ────────────────────────────────
+#
+# klug_emit is everything klug_dump does after the read. Driven here with a synthetic log
+# and the fake writer: the sink is "what reached stdout", so each test states the exact
+# bytes a flag must produce, and the call count pins the run coalescing (adjacent passing
+# lines go out in ONE write).
+
+fn _emit(min_level, log, src): i64 {
+    _wr_reset(0);
+    _wr_strict = 0;
+    return klug_emit(min_level, log, strlen(log), src, &_fake_writer, KLUG_WR_LINUX);
+}
+
+fn _sink_is(expected): i64 {
+    var n = strlen(expected);
+    if (_wr_sunk != n) { return 0; }
+    return memeq(&_wr_sink, expected, n);
+}
+
+fn test_emit_unfiltered_is_one_write_of_everything() {
+    var log = "6,1,100,-;boot ok\n3,2,200,-;disk error\n SUBSYSTEM=block\n4,3,300,-;low memory\n";
+    assert_eq(_emit(KLUG_LVL_ALL, log, KLUG_SRC_KMSG), 0, "bare dump -> 0");
+    assert_eq(_wr_calls, 1, "bare dump is ONE write, no per-line work");
+    assert_eq(_sink_is(log), 1, "bare dump is the log, byte for byte");
+    assert_eq(_emit(KLUG_LVL_ALL, "", KLUG_SRC_KMSG), 0, "empty log -> 0");
+    assert_eq(_wr_calls, 0, "empty log writes nothing");
+    return 0;
+}
+
+fn test_emit_kmsg_err_keeps_a_record_with_its_continuations() {
+    # -e over a /dev/kmsg log: the err record AND its dictionary lines, nothing else. The
+    # continuation state is threaded through the loop here — a per-line lens alone would
+    # drop " SUBSYSTEM=block" as level 0 and hand the operator an error with no device.
+    var log = "6,1,100,-;boot ok\n3,2,200,-;disk error\n SUBSYSTEM=block\n DEVICE=+block:sda\n4,3,300,-;low memory\n6,4,400,-;fine\n";
+    assert_eq(_emit(KLUG_LVL_ERR, log, KLUG_SRC_KMSG), 0, "-e -> 0");
+    assert_eq(_sink_is("3,2,200,-;disk error\n SUBSYSTEM=block\n DEVICE=+block:sda\n"), 1, "-e: the err record + both continuations, nothing else");
+    assert_eq(_wr_calls, 1, "-e: one contiguous run -> one write");
+    return 0;
+}
+
+fn test_emit_kmsg_warn_coalesces_adjacent_passing_lines() {
+    # -w: err + warning records. An info record between two passing runs splits them into
+    # two writes; adjacent passing lines (a record and its continuation, or two records in a
+    # row) go out together.
+    var log = "6,1,100,-;boot ok\n3,2,200,-;disk error\n SUBSYSTEM=block\n6,3,300,-;fine\n4,4,400,-;low memory\n4,5,500,-;still low\n6,6,600,-;fine again\n";
+    assert_eq(_emit(KLUG_LVL_WARN, log, KLUG_SRC_KMSG), 0, "-w -> 0");
+    assert_eq(_sink_is("3,2,200,-;disk error\n SUBSYSTEM=block\n4,4,400,-;low memory\n4,5,500,-;still low\n"), 1, "-w: err+continuation, then both warnings; infos dropped");
+    assert_eq(_wr_calls, 2, "-w: two runs (split by the info record) -> two writes");
+    # A continuation after a DROPPED record is dropped with it.
+    var log2 = "6,1,100,-;usb 1-2: new device\n SUBSYSTEM=usb\n DEVICE=+usb:1-2\n4,2,200,-;low memory\n";
+    assert_eq(_emit(KLUG_LVL_WARN, log2, KLUG_SRC_KMSG), 0, "-w (info+continuations) -> 0");
+    assert_eq(_sink_is("4,2,200,-;low memory\n"), 1, "-w: an info record's continuations go with it");
+    return 0;
+}
+
+fn test_emit_ring_warn_is_the_agnos_lens() {
+    # The same loop under the ring source: [W]/[E] pass (prefixed or not), plain kprintln and
+    # ring-3 lines drop, and a leading space is NOT a continuation here.
+    var log = "[    1.000000] [I] booting\n[W] low memory\nplain kprintln line\n  indented ring-3 output\n[    5.000000] [E] disk error\n[E] again\n";
+    assert_eq(_emit(KLUG_LVL_WARN, log, KLUG_SRC_RING), 0, "ring -w -> 0");
+    assert_eq(_sink_is("[W] low memory\n[    5.000000] [E] disk error\n[E] again\n"), 1, "ring -w: the [W] and both [E]s, plain + indented lines dropped");
+    assert_eq(_wr_calls, 2, "ring -w: two runs -> two writes");
+    assert_eq(_emit(KLUG_LVL_ERR, log, KLUG_SRC_RING), 0, "ring -e -> 0");
+    assert_eq(_sink_is("[    5.000000] [E] disk error\n[E] again\n"), 1, "ring -e: only the [E]s");
+    assert_eq(_wr_calls, 1, "ring -e: adjacent [E]s -> one write");
+    return 0;
+}
+
+fn test_emit_trailing_partial_line_is_filtered_too() {
+    # A log that does not end in a newline (a ring cut mid-line, or a record without its
+    # terminator): the trailing fragment goes through the same lens and the same run.
+    var log = "6,1,100,-;boot ok\n3,2,200,-;disk error\n SUBSYSTEM=block";
+    assert_eq(_emit(KLUG_LVL_ERR, log, KLUG_SRC_KMSG), 0, "-e with a partial tail -> 0");
+    assert_eq(_sink_is("3,2,200,-;disk error\n SUBSYSTEM=block"), 1, "-e: the partial continuation inherits and is kept");
+    assert_eq(_wr_calls, 1, "-e: record + partial continuation -> one write");
+    var log2 = "3,1,100,-;disk error\n6,2,200,-;fine";
+    assert_eq(_emit(KLUG_LVL_ERR, log2, KLUG_SRC_KMSG), 0, "-e with a dropped partial tail -> 0");
+    assert_eq(_sink_is("3,1,100,-;disk error\n"), 1, "-e: a partial info tail is dropped");
+    return 0;
+}
+
+fn test_emit_nothing_selected_is_still_exit_zero() {
+    # A ring with no tagged lines under -w: nothing written, exit 0 — and the "matched nothing
+    # because nothing is tagged" note goes to stderr (it prints during this test; it is not
+    # captured, the exit code and the empty stdout are what is asserted).
+    var log = "plain boot line\nanother plain line\n";
+    assert_eq(_emit(KLUG_LVL_WARN, log, KLUG_SRC_RING), 0, "nothing selected -> still 0");
+    assert_eq(_wr_calls, 0, "nothing selected -> nothing written");
+    return 0;
+}
+
+fn test_emit_write_failure_stops_and_reports_one() {
+    # Three runs under -w; the writer accepts the first and fails the second. The emit must
+    # return 1 and NOT keep writing runs past a failed one (a hole in the middle of a dump
+    # that then exits 0 is the 0.1.5 shape again).
+    var log = "4,1,100,-;w1\n6,2,200,-;i\n4,3,300,-;w2\n6,4,400,-;i\n4,5,500,-;w3\n";
+    _wr_reset(0);
+    _wr_strict = 0;
+    _wr_push(11);                                       # "4,1,100,-;w1\n" is 13 bytes: short by 2, then fail
+    _wr_push(0 - 32);                                   # -EPIPE on the retry
+    var rc = klug_emit(KLUG_LVL_WARN, log, strlen(log), KLUG_SRC_KMSG, &_fake_writer, KLUG_WR_LINUX);
+    assert_eq(rc, 1, "write failure -> 1");
+    assert_eq(_wr_calls, 2, "write failure: no further runs are attempted");
+    assert_eq(_wr_sunk, 11, "write failure: only the accepted prefix reached stdout");
+    return 0;
+}
+
 fn main(): i64 {
     test_group("klug severity lens — recognized prefixes");
     test_recognized_prefixes();
@@ -138,6 +559,37 @@ fn main(): i64 {
     test_severity_ordering();
     test_group("klug ring-size contract");
     test_ring_size_matches_kernel();
+    test_group("klug /dev/kmsg lens — priority -> level");
+    test_kmsg_priority_maps_to_level();
+    test_kmsg_facility_bits_are_ignored();
+    test_group("klug /dev/kmsg lens — not a record");
+    test_kmsg_not_a_record_is_untagged();
+    test_group("klug /dev/kmsg lens — continuation lines");
+    test_kmsg_continuation_lines_inherit_their_record();
+    test_group("klug lens is per-source, not per-byte");
+    test_lens_is_per_source_not_per_byte();
+    test_group("klug write loop — short writes");
+    test_write_loop_loops_over_short_writes();
+    test_write_loop_full_write_is_one_call();
+    test_write_loop_zero_length_never_writes();
+    test_group("klug write loop — Linux zero-return policy");
+    test_write_loop_linux_eintr_retries();
+    test_write_loop_linux_zero_is_fatal();
+    test_write_loop_linux_other_errno_is_fatal();
+    test_group("klug write loop — agnos backpressure policy");
+    test_write_loop_agnos_zero_is_backpressure();
+    test_write_loop_agnos_negative_is_fatal();
+    test_write_loop_agnos_stall_is_bounded();
+    test_write_loop_agnos_stall_resets_on_progress();
+    test_write_loop_production_constants();
+    test_group("klug emit — the filter over a whole log");
+    test_emit_unfiltered_is_one_write_of_everything();
+    test_emit_kmsg_err_keeps_a_record_with_its_continuations();
+    test_emit_kmsg_warn_coalesces_adjacent_passing_lines();
+    test_emit_ring_warn_is_the_agnos_lens();
+    test_emit_trailing_partial_line_is_filtered_too();
+    test_emit_nothing_selected_is_still_exit_zero();
+    test_emit_write_failure_stops_and_reports_one();
     return assert_summary();
 }
 

@@ -15,6 +15,7 @@ klug                  # dump the whole kernel log
 klug -w               # only warnings and errors
 klug -e               # only errors
 klug | grep panic     # filter — grep is the agnsh builtin
+sudo klug -e          # Linux dev host: err-and-worse records from /dev/kmsg
 ```
 
 ## How it works
@@ -24,7 +25,10 @@ klug | grep panic     # filter — grep is the agnsh builtin
   klug writes it to stdout. The syscall only ever copies the log ring, never other
   kernel memory.
 - **Linux** (dev-host dogfooding): reads `/dev/kmsg` so the tool runs and is
-  testable off-target.
+  testable off-target. Records are dumped as the raw wire format the kernel
+  hands out (`PRI,SEQ,TS,FLAG;msg`, plus ` KEY=VALUE` continuation lines on
+  device records) — klug does not reformat. Since 0.2.0 the severity lens works
+  here too, off each record's syslog priority (below).
 
 The severity lens (`-w`/`-e`) keys off the `[I]`/`[W]`/`[E]` prefixes the kernel
 emits. Unprefixed lines — boot output and raw `kprintln`, which is most of an AGNOS
@@ -43,9 +47,17 @@ Since AGNOS 1.56.58 every kernel-origin line also carries a Linux-style uptime f
 and unprefixed logs alike. Ring-3 program output is deliberately left undecorated by the kernel,
 so it never carries the field.
 
-Every `/dev/kmsg` record on the Linux dev-host path is unprefixed (they are wire
-records, `PRI,SEQ,TS,FLAG;msg`), so `-w`/`-e` print nothing there — the lens is an
-AGNOS feature, and the host build exists to exercise the dump path, not the lens.
+On the Linux dev-host path the lens reads each `/dev/kmsg` record's `PRI` field
+instead: `PRI & 7` is the syslog level (0 emerg … 3 err, 4 warning, 5 notice, 6
+info, 7 debug), so `-e` keeps level ≤ 3 and `-w` keeps level ≤ 4 — the same slice
+`dmesg --level=emerg,alert,crit,err[,warn]` makes. Facility bits are ignored (a
+userspace writer's `12,` is user.warning, still a warning). A ` KEY=VALUE`
+continuation line has no priority of its own and inherits its record's, so
+`klug -e` keeps an error's `SUBSYSTEM=`/`DEVICE=` context with the error. The
+two lenses never mix: the binary is told at build time which log it reads, so a
+ring-3 program's `3,foo` on AGNOS is just a line, and a `[E]` inside a `/dev/kmsg`
+message is just text. Reading `/dev/kmsg` needs root or `kernel.dmesg_restrict=0`;
+without it klug says so on stderr and exits 1.
 
 ## Build
 
@@ -54,6 +66,12 @@ cyrius build src/main.cyr build/klug          # host (Linux, /dev/kmsg)
 cyrius build --agnos src/main.cyr build/klug_agnos   # AGNOS (klug#36)
 cyrius test tests/klug.tcyr                    # tests
 ```
+
+The suite runs in-process on the host and covers both lenses, the short-write loop
+under both targets' zero-return policies (the AGNOS pipe-backpressure arm included —
+driven through a scripted writer, so it no longer needs iron to execute), and the
+filter over a whole log, byte-exact. CI additionally executes the host binary as
+root against the runner's real `/dev/kmsg`.
 
 On AGNOS, klug is staged onto the agnos-fs `/bin` via `agnos/scripts/burn/stage-tools.sh`
 and run through the shell's exec-from-disk path.

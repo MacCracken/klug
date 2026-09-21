@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-21 (the lens works on the dev host; the write loop is tested, not trusted)
+
+The first minor since 0.1.0. No toolchain move (still 6.6.6); every change is klug's own. Tests
+**37 → 155**, reference coverage **50% → 75%**, and CI now executes the binary. Both shipped
+binaries changed (`build/klug` 139,104 → 139,400 B · `build/klug_agnos` 139,104 → 143,280 B).
+
+### Added
+
+- ⭐ **The severity lens works on Linux.** `-w`/`-e` on the dev host used to print nothing —
+  every `/dev/kmsg` record scored level 0 because none starts with `[W]`, and the README said as
+  much ("the lens is an AGNOS feature"). Now each record's `PRI` field is read: `PRI & 7` is the
+  syslog level, `-e` keeps ≤ 3 (emerg/alert/crit/err) and `-w` keeps ≤ 4 (+ warning) — the slice
+  `dmesg --level` makes. Facility bits are ignored (a userspace writer's `12,` is user.warning,
+  still a warning). A ` KEY=VALUE` continuation line — the dictionary the kernel appends to
+  dev_printk records — carries no priority and **inherits its record's**, so `klug -e` keeps an
+  error's `SUBSYSTEM=`/`DEVICE=` context with it rather than dropping it as level-0 noise.
+  Output is still the raw wire record; klug does not reformat.
+  ⛔ **The two lenses never mix.** The lens is TOLD which log it is reading (`KLUG_SRC_RING` /
+  `KLUG_SRC_KMSG`, picked once at build time in `klug_dump`) rather than sniffing the bytes —
+  sniffing would make a ring-3 program's `3,foo` CSV line on agnos an alert under `-e`, and a
+  `[E]` inside a `/dev/kmsg` message a tag. Pinned both ways in `tests/klug.tcyr`
+  (`test_lens_is_per_source_not_per_byte`): the same bytes score ERR on one source and ALL on
+  the other, and a leading space is a continuation on `/dev/kmsg` only. `--help` on the Linux
+  build says how the lens reads `/dev/kmsg`; the README's "the host build exists to exercise the
+  dump path, not the lens" paragraph is gone.
+- **CI executes the host binary** (`Smoke` step in `ci.yml`, so the release gate inherits it).
+  `cyrius test` had always been the whole gate, and it never ran `build/klug` — the binary was
+  built and shipped untouched. Now: `--help` exits 0 with usage on stdout; an unknown option
+  exits 2 with prose on stderr and **nothing on stdout** (fd 1 carries the dump); unprivileged,
+  either the dump or the "kernel log unavailable" note with an empty stdout, whichever the
+  runner's `dmesg_restrict` gives; and as root — the only place the `/dev/kmsg` read path runs
+  at all — a non-empty dump, every `-w` record at syslog level ≤ 4, every `-e` record ≤ 3,
+  and `-e ⊆ -w ⊆ full` by line count. `-e` may be empty on a clean boot, so the assertion is on
+  what is emitted, never on how much. The awk gates were checked to reject a leaked info record
+  under `-w` and a leaked warning under `-e` before they were trusted to pass.
+
+### Changed
+
+- ⛔ **`klug_write_all` — the 0.1.5 short-write fix, the reason `klug | grep panic` delivers
+  the panic line — had never been unit-tested.** It hard-coded `write(1, …)`, so the only thing
+  that had ever executed its agnos arm was iron. It is now `klug_write_loop(writer, mode, p, len)`:
+  the writer is a function pointer (`lib/fnptr.cyr`, already in the include graph via `alloc`,
+  now declared explicitly in `main.cyr`) and the zero-return policy is a VALUE — `KLUG_WR_LINUX`
+  (0 is pathological, −EINTR retries, any other errno is fatal) or `KLUG_WR_AGNOS` (0 is pipe
+  backpressure: yield and retry, bounded by `KLUG_STALL_MAX`; any negative is fatal) — so both
+  arms compile and run on the host. `klug_dump` picks the policy for its target and hands
+  `klug_stdout_write` (fd 1, one raw write) to the loop. The tests drive it with a scripted fake
+  writer whose sink records every accepted byte, so each case states the exact bytes that reached
+  the fd and the exact number of write calls, and a strict mode asserts every call offered
+  precisely `(p + sent, len − sent)` — the arithmetic that, if wrong, ships a dump with a hole in
+  it and exit 0. Cases: short writes loop (both policies, including the 4080-of-4096 pipe-cap
+  shape); a full write is one call; `len == 0` never calls `write`; Linux retries −EINTR at the
+  same offset, fails on 0, fails on −EAGAIN/−EPIPE; agnos retries 0 at the same offset, fails on
+  −1 and even on −4; the stall bound trips at exactly `KLUG_STALL_MAX + 1` calls (run at a small
+  bound for precision AND once at the shipped 100,000, so the constant is proven finite rather
+  than declared); and the bound is on CONSECUTIVE stalls — a slow consumer that drains a byte
+  now and then never trips it, with a control that trips on the fourth stall of a burst.
+  **Mutation-checked**: no stall reset, re-offer from the buffer start, offer the whole `len`
+  every time, Linux 0 retried, every errno retried, agnos negative retried — each reddens
+  (4–7 rows); the unbounded-stall mutant does not fail, it HANGS, which is the failure the bound
+  exists to prevent, and the harness timeout is what reports it. One mutant survives and is
+  equivalent: `if (r == 0) return 1` on the Linux arm is documentation, because the
+  `r != −EINTR` line after it already refuses 0.
+- ⭐ **`klug_dump` is split: the read half keeps its name, everything after the read is
+  `klug_emit(min_level, buf, n, src, writer, mode)`** — pure over its arguments, so the filter
+  over a WHOLE log runs under the harness against a synthetic buffer and the fake writer, and
+  each test states the exact stdout bytes a flag must produce. This is what pins the parts the
+  per-line tests could not reach: the continuation state threaded through the loop (an error
+  record's dictionary lines survive `-e`; an info record's go with it), adjacent passing lines
+  coalescing into ONE write with an info record splitting runs into two, the trailing partial
+  line (a ring cut mid-line, or a record without its terminator) going through the same lens
+  and run, "nothing selected" still exiting 0 with nothing written, and a write failure in the
+  middle stopping the emit at once with exit 1 rather than continuing past a hole. Six mutants
+  (no continuation state, keep writing after a failure, drop the partial line, flush per line,
+  `>` for `>=` at both filter sites) each redden 1–15 rows. The bare-dump fast path is an
+  optimisation, not observable behaviour: disabling it produces identical stdout and the same
+  single write, so its mutant survives by construction.
+- **The lens API takes a source.** `klug_level_of(p, len, src)`, `klug_has_level_tag(p, len,
+  src)`, plus `klug_kmsg_pri_level(p, len)` (the `/dev/kmsg` primitive: level or −1 for
+  not-a-record — no leading decimal run, no comma after it, or an 11th digit) and
+  `klug_line_level(p, len, src, prev)` (the continuation-aware level the dump filters on). The
+  37 pre-existing ring assertions pass unchanged with `KLUG_SRC_RING` spelled out; on the
+  `/dev/kmsg` source a record header IS the tag, so an info record counts as tagged exactly as
+  `[I]` does and the 0.1.6 "matched nothing because nothing is tagged" note still means what it
+  says on both sources (its text now names both tag forms).
+- **Every public fn in `src/` is documented** (`cyrius doc --check`: 11/11 in `klug.cyr`, was
+  5/7; `main.cyr` 1/1): `klug_level_of`, `klug_usage` and `main` gained the comment they lacked,
+  and each new fn came with one. `cyrius audit` is clean on fmt and lint; its docs count is now
+  entirely `tests/klug.tcyr`, whose `test_*` fns carry their rationale inside the body, as the
+  pre-existing ones always did.
+
+### Fixed
+
+- **The `/dev/kmsg` priority parser's digit cap fired on the 11th BYTE, not the 11th digit**, so a
+  10-digit priority followed by its comma was refused as not-a-record. Caught by the suite on its
+  first run (`10 digits is still parsed (cap is 10)`) and fixed before it shipped — recorded
+  because it is the first bug the new tests found, and it was in the new code.
+
 ## [0.1.11] - 2026-09-21
 
 ### Changed

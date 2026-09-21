@@ -3,6 +3,7 @@
 
 include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
+include "lib/fnptr.cyr"
 include "lib/string.cyr"
 include "lib/fmt.cyr"
 include "lib/io.cyr"
@@ -13,6 +14,9 @@ include "src/klug.cyr"
 # allocates N×u64, so var[KLUG_RING_WORDS] (8192) = 65536 bytes = KLUG_RING_BYTES (matches the kernel ring).
 var klug_buf[KLUG_RING_WORDS];
 
+# Entry: parse the severity flag(s), then dump. Exit 0 = dumped (a filter that matched
+# nothing is still 0 — see the stderr note in klug_dump), 1 = read or write failed,
+# 2 = usage error. Flags are rejected, never ignored: see the comment in the loop.
 fn main(): i64 {
     args_init();
     var min_level = KLUG_LVL_ALL;

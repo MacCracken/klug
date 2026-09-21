@@ -54,3 +54,49 @@ jobs:
         # tests/ recursively since 6.4.72 — but naming the file keeps the gate
         # pinned to the one suite this repo has.
         run: cyrius test tests/klug.tcyr
+
+      - name: Smoke (execute the host binary)
+        # `cyrius test` runs the lenses, the write loop and the emit path in-process.
+        # This step is the only place the BINARY runs, and the only place the
+        # /dev/kmsg READ runs at all. The contract:
+        #   · --help: exit 0, usage on stdout.
+        #   · an unknown option: exit 2, prose on stderr and NOTHING on stdout —
+        #     fd 1 carries the dump, so error prose there would land inside
+        #     `klug > f.txt` and be piped into `klug | grep`.
+        #   · unprivileged: either the dump (exit 0) or the "kernel log
+        #     unavailable" note (exit 1). Which one depends on the runner's
+        #     kernel.dmesg_restrict, so both are accepted — but exit 1 must come
+        #     with an EMPTY stdout.
+        #   · as root (GitHub-hosted runners have passwordless sudo): a non-empty
+        #     dump; every record `-w` emits carries syslog level <= 4 and every
+        #     record `-e` emits level <= 3 (PRI is the field before the first
+        #     comma; `PRI % 8` is the level). Continuation lines start with a
+        #     space, inherit their record's level, and are skipped by the check.
+        #     `-e` may legitimately be EMPTY on a clean boot, so the assertion is
+        #     on what is emitted, never on how much — plus -e ⊆ -w ⊆ full by
+        #     line count, which holds because all three reads cover the same
+        #     first 64 KB of records.
+        run: |
+          set -eu
+          ./build/klug --help > help.txt
+          test -s help.txt
+          rc=0; ./build/klug --bogus > out.txt 2> err.txt || rc=$?
+          test "$rc" = 2
+          test ! -s out.txt
+          test -s err.txt
+          rc=0; ./build/klug > unpriv.txt 2> unpriv.err || rc=$?
+          if [ "$rc" = 1 ]; then
+            test ! -s unpriv.txt
+            grep -q 'kernel log unavailable' unpriv.err
+          else
+            test "$rc" = 0
+          fi
+          sudo ./build/klug > full.txt
+          test -s full.txt
+          sudo ./build/klug -w > warn.txt
+          sudo ./build/klug -e > errs.txt
+          awk -F, '/^ / { next } { if (($1 % 8) > 4) { print "not a warning: " $0; bad = 1 } } END { exit bad + 0 }' warn.txt
+          awk -F, '/^ / { next } { if (($1 % 8) > 3) { print "not an error: " $0; bad = 1 } } END { exit bad + 0 }' errs.txt
+          test "$(wc -l < errs.txt)" -le "$(wc -l < warn.txt)"
+          test "$(wc -l < warn.txt)" -le "$(wc -l < full.txt)"
+          echo "smoke: full=$(wc -l < full.txt) lines, -w=$(wc -l < warn.txt), -e=$(wc -l < errs.txt)"
