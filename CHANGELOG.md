@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-09-21
+
+### Changed
+
+- **Toolchain `6.6.4` → `6.6.6`** (through 6.6.5), ahead of agnos this time (agnos is still on 1.57.4 /
+  6.6.4). Vendored `lib/` re-synced from the pin (`cyrius lib sync`, **24/24** byte-match against the
+  6.6.6 snapshot, nothing stale). The `[deps].stdlib` closure grew **23 → 24** files with no manifest
+  change: 6.6.6's `lib/alloc.cyr` now includes `lib/alloc_cx.cyr` (the cx bytecode target's allocator
+  peer), and `lib/string.cyr` includes `lib/alloc.cyr` itself so `strdup`/`strndup` no longer trap when
+  it is included alone. No source change; nothing klug calls moved — `println`/`streq`/`strlen`,
+  `args_init`/`argc`/`argv`, `sys_open`, `sys_klug` and the agnos `sys_sched_yield` are all unchanged
+  (Linux gained its own `sys_sched_yield` in 6.6.5, which klug's `#ifndef` arm never reaches). The two
+  upstream upgrade notes do not apply here: the 6.6.5 aarch64 `SYS_UNLINKAT` 35 → 263 move (klug has no
+  aarch64 target and never unlinks) and the 6.6.6 Windows `O_APPEND`/`O_TRUNC` fix (no PE target).
+  **Both shipped binaries changed** with the stdlib (`build/klug` 134,864 → 139,104 B · `build/klug_agnos`
+  139,056 → 139,104 B); the 6.6.4 build was first re-verified byte-reproducible from the pristine tree
+  so the delta is the toolchain's alone. Tests **37/37** at the new pin; `cyrius vet` / `lint
+  --strict-deferrals` / `fmt --check` all clean.
+- **CI: `actions/checkout` `v4` → `v7`, `softprops/action-gh-release` `v2` → `v3`.** Both majors are
+  runtime moves (Node 20 → Node 24; checkout v7 also refuses fork checkouts under `pull_request_target`
+  / `workflow_run`, neither of which klug uses) with no input changes — `generate_release_notes` and
+  `files: build/*` are untouched. GitHub-hosted `ubuntu-latest` already meets checkout's runner floor
+  (v2.327.1). The toolchain install step is unchanged: the upstream installer, driven by the manifest
+  pin, per the 6.5.24+ `versions/<pin>/lib` layout requirement.
+
 ## [0.1.10] - 2026-09-14
 
 ### Changed
