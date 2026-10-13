@@ -144,10 +144,11 @@ fn klug_level_of(p, len, src): i64 {
 # ⛔⛔ WHY THIS EXISTS — `-w`/`-e` COULD REPORT "NO WARNINGS" ON A KERNEL THAT HAS NO
 # LENS AT ALL, AND THAT IS THE STATE AGNOS SHIPS IN TODAY. The kernel's klug_info/
 # klug_warn/klug_err have exactly THREE call sites and all three sit inside
-# `#ifdef EXEC_SELFTEST` (agnos kernel/core/main.cyr:2737-2739, guarded 2589-3038),
-# which is off in every production build. So a real boot log contains ZERO tagged
-# lines, every line scores level 0, `klug -w` prints nothing and exits 0 — and
-# "this box logged no warnings" is indistinguishable from "this filter is a no-op".
+# `#ifdef EXEC_SELFTEST` (agnos kernel/core/main.cyr `exec_disk_selftest`; lines 3072-3074,
+# guarded 2924-3370, as of agnos 1.57.12), which is off in every production build. So a
+# real boot log contains ZERO tagged lines, every line scores level 0, `klug -w` prints
+# nothing and exits 0 — and "this box logged no warnings" is indistinguishable from
+# "this filter is a no-op".
 # A tool that cannot tell those apart is worse than one without the flag.
 #
 # ⚠ AND IT IS ABOUT TO MATTER MORE, NOT LESS. The lens is a FIXED-OFFSET test — '['
@@ -215,12 +216,13 @@ fn klug_usage(): i64 {
     # it is how the log survives being read. A pipe is safe for the same reason
     # the redirect is: a pipe fd takes vfs_write's VFS_PIPE arm, never kprint, so
     # only grep's matched lines are console-bound.
-    # ⛔ Do NOT drop this note when the kernel-side fix lands — suppressing the
+    # ⛔ Do NOT drop this note if a kernel-side fix ever lands — suppressing the
     # tap for klug#36's own output fixes THIS tool, not the property (any large
-    # console dump still ages the ring), and klug ships as a committed binary
-    # that is staged onto older kernels by agnos/scripts/burn/stage-tools.sh.
-    # Tracked agnos-side: docs/development/state.md OPEN, roadmap.md (HID row),
-    # and the `run /bin/klug > /f.txt` note at core/syscall.cyr:442-444.
+    # console dump still ages the ring), and klug is staged onto older kernels
+    # by agnos/scripts/burn/stage-tools.sh.
+    # agnos-side: docs/development/state.md records the mechanism as unfixed BY
+    # DECISION (1.56.48), and core/syscall.cyr `fault_kill_current` carries the
+    # same `run /bin/klug > /f.txt` note.
     #ifdef CYRIUS_TARGET_AGNOS
     println("");
     println("on AGNOS, redirect instead of dumping to the console:");
@@ -241,8 +243,19 @@ fn klug_usage(): i64 {
 
 # -EINTR. klug installs no signal handlers, so this is belt-and-braces.
 var KLUG_EINTR = 0 - 4;
-# Bound on consecutive no-progress agnos yields before we call the consumer gone.
+# -EAGAIN / -EPIPE as a /dev/kmsg read returns them (Linux values; the drain is Linux-only).
+var KLUG_EAGAIN = 0 - 11;
+var KLUG_EPIPE = 0 - 32;
+# Bound on consecutive no-progress retries before we give up: agnos write yields (the consumer
+# is gone) and /dev/kmsg -EINTR / -EPIPE re-reads (the reader never yields a record).
 var KLUG_STALL_MAX = 100000;
+
+# The largest record a /dev/kmsg read hands out: the kernel's CONSOLE_EXT_LOG_MAX, the size of
+# devkmsg_read's output buffer (longer records are truncated to it). ⛔ NOT AN OPTIMISATION: a
+# read offered fewer bytes than the next record fails -EINVAL, and devkmsg_read advances the
+# reader past that record BEFORE its size check — the record is lost, not held back. The drain
+# offers at least this much on every read so that can never happen.
+var KLUG_KMSG_REC_MAX = 8192;
 
 # Zero-return policy for the write loop — what a write that accepted NOTHING means. Chosen
 # per target in klug_dump and passed to the loop as a VALUE, so both arms are compiled,
@@ -255,6 +268,12 @@ var KLUG_WR_AGNOS = 1;   # 0 is pipe backpressure (yield + retry, bounded by KLU
 # Shaped `(p, len) -> count-or-negative-errno` so a test can stand a scripted fake in its place.
 fn klug_stdout_write(p, len): i64 {
     return syscall(SYS_WRITE, 1, p, len);
+}
+
+# The production reader: one raw read of `fd` — on /dev/kmsg, exactly one record. Shaped
+# `(fd, p, len) -> count-or-negative-errno` so a test can stand a scripted fake in its place.
+fn klug_fd_read(fd, p, len): i64 {
+    return syscall(SYS_READ, fd, p, len);
 }
 
 # Write EXACTLY `len` bytes from `p` through `writer` (a `&fn(p, len)` returning the count
@@ -309,57 +328,115 @@ fn klug_err_line(s: cstring): i64 {
     return 0;
 }
 
-# Read the kernel log into `buf` (must be KLUG_RING_BYTES bytes) and write the
-# lines at or above `min_level` to stdout. Returns 0 on success, 1 on read
-# failure or an incomplete write. This is the I/O half: it reads the log this
-# target has and hands the bytes to klug_emit with this target's lens source and
-# write policy. Everything after the read is klug_emit, so it can run under the
-# test harness against a synthetic buffer and a scripted writer.
+# Read the kernel log into `buf` (KLUG_RING_BYTES bytes) and write the lines at or
+# above `min_level` to stdout. Returns 0 on success, 1 on a read failure or an
+# incomplete write. This is the I/O half: it opens the log this target has and hands
+# it to code that runs under the test harness — klug_emit (agnos: the whole ring is
+# one read) or klug_kmsg_drain (Linux: /dev/kmsg, batch by batch) — with this
+# target's lens source (see KLUG_SRC_*) and write policy (see KLUG_WR_*).
 fn klug_dump(min_level, buf): i64 {
-    var n = 0;
-    # The lens is told which log it is reading (see KLUG_SRC_*): the ring on agnos, /dev/kmsg
-    # wire records on the Linux dev host. The writer gets this target's zero-return policy.
-    var src = KLUG_SRC_RING;
-    var mode = KLUG_WR_AGNOS;
-    #ifndef CYRIUS_TARGET_AGNOS
-    src = KLUG_SRC_KMSG;
-    mode = KLUG_WR_LINUX;
-    #endif
     #ifdef CYRIUS_TARGET_AGNOS
     # Native: klug#36 copies the klug ring into buf and returns bytes written. It
-    # only ever copies klug_buf, never other kernel memory, so it can't leak.
-    n = sys_klug(buf, KLUG_RING_BYTES);
+    # only ever copies klug_buf, never other kernel memory, so it can't leak. The
+    # ring is exactly KLUG_RING_BYTES, so one read is the whole log.
+    var n = sys_klug(buf, KLUG_RING_BYTES);
     if (n < 0) { klug_err_line("klug: kernel log read failed"); return 1; }
+    return klug_emit(min_level, buf, n, KLUG_SRC_RING, &klug_stdout_write, KLUG_WR_AGNOS);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     # Dev-host dogfooding: the klug ring is agnos-only, so dump the Linux kernel
     # ring via /dev/kmsg. The node is mode 0644, but `kernel.dmesg_restrict=1` (the
     # default on systemd distros) makes open() return EPERM for non-root anyway, so
     # an unprivileged run normally lands in the branch below — that is the host
-    # policy, not a klug failure. O_RDONLY|O_NONBLOCK so read returns once the
-    # buffer is drained (EAGAIN) instead of blocking for future messages; one
-    # record per read, accumulated into buf up to capacity.
-    var fd = sys_open("/dev/kmsg", 2048, 0);            # 2048 = O_NONBLOCK (0o4000)
+    # policy, not a klug failure. O_NONBLOCK so a read returns -EAGAIN once the log
+    # is drained instead of blocking for future messages.
+    var fd = sys_open("/dev/kmsg", O_RDONLY | O_NONBLOCK, 0);
     if (fd < 0) {
         klug_err_line("klug: kernel log unavailable on this host (open /dev/kmsg failed);");
         klug_err_line("      needs root, or kernel.dmesg_restrict=0.");
         klug_err_line("      the native reader is agnos klug#36 — build with `cyrius build --agnos`.");
         return 1;
     }
-    var off = 0;
+    var rc = klug_kmsg_drain(&klug_fd_read, fd, buf, KLUG_RING_BYTES, min_level, &klug_stdout_write, KLUG_WR_LINUX);
+    syscall(SYS_CLOSE, fd);
+    return rc;
+    #endif
+}
+
+# Drain /dev/kmsg — open as `fd`, O_NONBLOCK — through `reader` (a `&fn(fd, p, len)`
+# returning the bytes read or a negative errno; klug_dump hands it klug_fd_read) into
+# `buf` (`cap` bytes), emitting it batch by batch through klug_emit_lines. Returns 0
+# when the whole log was dumped, 1 when a read or a write failed (what was read before
+# a read failure is still emitted, and said on stderr to be incomplete).
+#
+# ⛔ WHY IT STREAMS. Through 0.2.0 the Linux arm read until the 64 KB buffer was full
+# and stopped. A fresh /dev/kmsg open starts at the OLDEST record, so on any host whose
+# log is over 64 KB — the x86 default ring is 128 KB, and a box that has been up a
+# while keeps it full — klug dumped the oldest 64 KB, silently dropped the NEWEST
+# records (the ones an operator reaches for) and exited 0. Now a batch is emitted
+# whenever the buffer cannot take another worst-case record, the buffer is reused, and
+# the dump is the whole log at any size.
+#
+# Every read is offered at least KLUG_KMSG_REC_MAX bytes (see there: that is what keeps
+# a record from being dropped). One read returns exactly one record WITH its " KEY=VAL"
+# continuation lines, so a batch always ends on a record boundary and the continuation
+# state inside klug_emit_lines never has to cross one.
+#
+# What a read returns, as devkmsg_read hands it out:
+#   > 0      a record — keep reading.
+#   -EAGAIN  caught up (O_NONBLOCK): the end of the log. So is 0, which /dev/kmsg never returns.
+#   -EPIPE   the kernel overwrote records this reader had not reached and moved it on to the
+#            oldest survivor: the dump has a GAP there. Carry on (dmesg does), and say so on
+#            stderr, because a gap nobody mentions reads as a complete log.
+#   -EINTR   retry (belt-and-braces; klug installs no handlers).
+#   other    a real failure: stop, emit what was read, exit 1.
+# -EPIPE / -EINTR retries are bounded by KLUG_STALL_MAX consecutive non-records, so a
+# reader that never yields one cannot spin klug forever.
+fn klug_kmsg_drain(reader, fd, buf, cap, min_level, writer, mode): i64 {
+    var off = 0;                                        # bytes in the current batch
+    var total = 0;                                      # bytes read, every batch
+    var tagged = 0;                                     # severity-tagged lines, every batch
+    var gap = 0;                                        # an -EPIPE was seen
+    var failed = 0;                                     # a read failed for real
+    var stall = 0;                                      # consecutive retries without a record
+    var t = 0;
     var draining = 1;
     while (draining == 1) {
-        if (off >= KLUG_RING_BYTES) { draining = 0; }
+        if (cap - off < KLUG_KMSG_REC_MAX) {            # no room for a worst-case record: flush
+            t = klug_emit_lines(min_level, buf, off, KLUG_SRC_KMSG, writer, mode);
+            if (t < 0) { return klug_emit_done(min_level, t, total); }   # stop: never read past a hole
+            tagged = tagged + t;
+            off = 0;
+        }
+        var m = fncall3(reader, fd, buf + off, cap - off);
+        if (m > 0) { off = off + m; total = total + m; stall = 0; }
         else {
-            var m = syscall(SYS_READ, fd, buf + off, KLUG_RING_BYTES - off);
-            if (m <= 0) { draining = 0; }
-            else { off = off + m; }
+            var retry = 0;
+            if (m == KLUG_EPIPE) { gap = 1; retry = 1; }
+            if (m == KLUG_EINTR) { retry = 1; }
+            if (retry == 1) {
+                if (stall >= KLUG_STALL_MAX) { failed = 1; draining = 0; }
+                stall = stall + 1;
+            } else {
+                if (m != 0) {
+                    if (m != KLUG_EAGAIN) { failed = 1; }
+                }
+                draining = 0;
+            }
         }
     }
-    syscall(SYS_CLOSE, fd);
-    n = off;
-    #endif
-    return klug_emit(min_level, buf, n, src, &klug_stdout_write, mode);
+    t = klug_emit_lines(min_level, buf, off, KLUG_SRC_KMSG, writer, mode);
+    if (t < 0) { return klug_emit_done(min_level, t, total); }
+    tagged = tagged + t;
+    if (gap == 1) {
+        klug_err_line("klug: the kernel overwrote /dev/kmsg records before klug reached them —");
+        klug_err_line("      the dump has a GAP (the log moved faster than it was read).");
+    }
+    if (failed == 1) {
+        klug_err_line("klug: kernel log read failed — the dump is INCOMPLETE");
+        return 1;
+    }
+    return klug_emit_done(min_level, tagged, total);
 }
 
 # Write the lines of `buf[0..n)` that score at or above `min_level` under the `src`
@@ -368,15 +445,47 @@ fn klug_dump(min_level, buf): i64 {
 # still 0 — it is reported on stderr, not in the exit code), 1 on a write failure.
 # Pure over its arguments: the harness drives it with a synthetic log and the
 # scripted fake writer, which is how the run coalescing, the trailing partial line
-# and the continuation-state threading are pinned without a /dev/kmsg.
+# and the continuation-state threading are pinned without a /dev/kmsg. It is
+# klug_emit_lines then klug_emit_done: the whole log in ONE buffer (the agnos ring).
 fn klug_emit(min_level, buf, n, src, writer, mode): i64 {
+    return klug_emit_done(min_level, klug_emit_lines(min_level, buf, n, src, writer, mode), n);
+}
+
+# The verdict on a dump: `t` is what klug_emit_lines returned (summed over the batches
+# when the log came in several) and `n` the bytes the log held. Says on stderr what the
+# exit code cannot — an incomplete dump, or a filter that matched nothing because the
+# log carries no tags — and returns the exit code: 1 on a write failure, else 0.
+fn klug_emit_done(min_level, t, n): i64 {
+    if (t < 0) {
+        klug_err_line("klug: stdout write failed — the dump is INCOMPLETE");
+        return 1;
+    }
+    if (n <= 0) { return 0; }
+    if (min_level == KLUG_LVL_ALL) { return 0; }
+    # ⛔ A FILTER THAT MATCHED NOTHING BECAUSE THERE IS NOTHING TO MATCH IS NOT "no warnings".
+    # Said on stderr, so stdout stays byte-exact for `klug -w | grep …` and the exit code stays 0
+    # (this is a diagnostic about the corpus, not a failure of the dump).
+    if (t == 0) {
+        klug_err_line("klug: no severity-tagged lines in the log — this filter matched nothing");
+        klug_err_line("      because the log carries no severity tags ([I]/[W]/[E] on agnos, a");
+        klug_err_line("      <pri> on /dev/kmsg), NOT because there are no warnings. Use a bare");
+        klug_err_line("      `klug` (or `klug | grep -i panic`) instead.");
+    }
+    return 0;
+}
+
+# Write the lines of `buf[0..n)` that score at or above `min_level` under the `src` lens
+# through `writer` with policy `mode` — klug_emit without the verdict, so a log that
+# arrives in batches (klug_kmsg_drain) can be emitted piece by piece and judged once.
+# Returns the number of severity-tagged lines seen (>= 0; the unfiltered fast path does
+# not count them and returns 0), or -1 on a write failure.
+fn klug_emit_lines(min_level, buf, n, src, writer, mode): i64 {
     if (n <= 0) { return 0; }
     var rc = 0;
     # Fast path: no filtering → one write of the whole log.
     if (min_level == KLUG_LVL_ALL) {
-        rc = klug_write_loop(writer, mode, buf, n);
-        if (rc != 0) { klug_err_line("klug: stdout write failed — the dump is INCOMPLETE"); }
-        return rc;
+        if (klug_write_loop(writer, mode, buf, n) != 0) { return 0 - 1; }
+        return 0;
     }
     # Filtered: emit line-by-line, dropping lines below min_level. Adjacent passing
     # lines are contiguous in buf, so they are coalesced into ONE write: a run is
@@ -420,15 +529,6 @@ fn klug_emit(min_level, buf, n, src, writer, mode): i64 {
             if (klug_write_loop(writer, mode, buf + run_start, run_end - run_start) != 0) { rc = 1; }
         }
     }
-    if (rc != 0) { klug_err_line("klug: stdout write failed — the dump is INCOMPLETE"); }
-    # ⛔ A FILTER THAT MATCHED NOTHING BECAUSE THERE IS NOTHING TO MATCH IS NOT "no warnings".
-    # Said on stderr, so stdout stays byte-exact for `klug -w | grep …` and the exit code stays 0
-    # (this is a diagnostic about the corpus, not a failure of the dump).
-    if (tagged == 0) {
-        klug_err_line("klug: no severity-tagged lines in the log — this filter matched nothing");
-        klug_err_line("      because the log carries no severity tags ([I]/[W]/[E] on agnos, a");
-        klug_err_line("      <pri> on /dev/kmsg), NOT because there are no warnings. Use a bare");
-        klug_err_line("      `klug` (or `klug | grep -i panic`) instead.");
-    }
-    return rc;
+    if (rc != 0) { return 0 - 1; }
+    return tagged;
 }

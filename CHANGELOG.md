@@ -7,6 +7,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-13 (cyrius 6.6.20; the Linux dump is the whole log, not its oldest 64 KB)
+
+Toolchain **6.6.6 → 6.6.20** with a vendored-`lib/` re-sync, then an audit pass. The audit found one real bug in
+klug's own code, on the dev-host path, and fixed it. Tests **155 → 212**. Both shipped binaries changed
+(`build/klug` 139,400 → 161,328 B · `build/klug_agnos` 143,280 → 177,960 B). The toolchain alone accounts for
+161,096 / 177,744 B (the 0.2.0 source rebuilt at 6.6.20), so klug's own change is +232 / +216 B. Both binaries
+reproduce byte-for-byte from a pristine copy of the tracked tree.
+
+### Fixed
+
+- ⛔ **On Linux, klug dumped only the OLDEST 64 KB of the kernel log and silently dropped the newest records, exit 0.**
+  The `/dev/kmsg` arm read records into the 64 KB buffer until it was full, then stopped. A fresh `/dev/kmsg` open
+  starts at the oldest record, so on any host whose log is over 64 KB the dump ended before the present. That covers
+  the x86 default 128 KB ring (`CONFIG_LOG_BUF_SHIFT=17`), and any box that has been up a while keeps it full: the dev
+  host measured here has logged 2.5 MB of kernel text this boot. `klug -e` therefore missed every error after the
+  cut, which is exactly the error an operator is looking for. Two more silent truncations sat in the same loop: a
+  mid-read `-EPIPE` (the kernel overwrote records before klug reached them) and a mid-read `-EINTR` both ended the
+  dump as if the log were over. The AGNOS path was never affected (the ring is exactly 64 KB, and one klug#36 read
+  drains it).
+  - **Fix: `klug_kmsg_drain(reader, fd, buf, cap, min_level, writer, mode)` streams the log.** It emits a batch
+    whenever the buffer cannot take another worst-case record, then reuses the buffer, so the dump is the whole log
+    at any size.
+  - Every read is offered at least `KLUG_KMSG_REC_MAX` = 8192 B (the kernel's `CONSOLE_EXT_LOG_MAX`). This is not
+    an optimisation: `devkmsg_read` advances past a record before its size check, so a read too small for the next
+    record LOSES it with `-EINVAL`. One read is one record with its continuation lines, so batches end on record
+    boundaries and the `-e` continuation state never crosses one.
+  - Read returns now have defined meanings:
+    - `-EAGAIN` (or 0) ends the log.
+    - `-EPIPE` is a gap: klug carries on from the oldest surviving record, as dmesg does, and says on stderr that
+      the dump has a gap.
+    - `-EINTR` retries.
+    - Both retry kinds are bounded by `KLUG_STALL_MAX` consecutive non-records.
+    - Any other errno is a real failure: what was read is still emitted, and klug says the dump is INCOMPLETE and
+      exits 1.
+  - A write failure at a batch flush stops the drain at once. klug never reads on and writes a later batch past a
+    hole.
+  - The reader is a function pointer (`klug_fd_read` in production), like the 0.2.0 writer, so all of this runs
+    under the harness.
+- **13 column-limit lint warnings in `tests/klug.tcyr`, shipped in 0.2.0.** That release said "`cyrius audit` is
+  clean on fmt and lint", which was true for `src/` only. The long lines are wrapped now:
+  - `_kline` / `_rline` helpers (like `_klevel`).
+  - Multi-line asserts.
+  - A `_cat` helper for the three long fixture logs. Cyrius has no adjacent-literal concatenation; see *Upstream*.
+
+  `cyrius audit` now reports lint clean across `src/` and `tests/`.
+- **Stale agnos citations.**
+  - klug cited the three `klug_info` / `klug_warn` / `klug_err` call sites at `kernel/core/main.cyr:2737-2739`.
+    They are at 3072-3074 as of agnos 1.57.12 (guard 2924-3370). They are still inside `#ifdef EXEC_SELFTEST`, so
+    the "no tagged lines in production" claim still holds. They are now also cited by fn (`exec_disk_selftest`).
+  - klug cited the `run /bin/klug > /f.txt` note at `core/syscall.cyr:442-444`. It now lives in
+    `fault_kill_current`.
+  - The help comment said the console re-append was tracked "OPEN" in agnos `state.md` and `roadmap.md`. agnos
+    records it as unfixed *by decision* (1.56.48), and the roadmap row is gone. Updated in `src/klug.cyr` and the
+    README.
+
+  Re-verified unchanged against agnos 1.57.12: the 64 KB ring, `PIPE_RING = 4080`, and `klog_build_prefix`.
+- `sys_open("/dev/kmsg", 2048, 0)` → `O_RDONLY | O_NONBLOCK` (same value). This clears the lint note about raw
+  literal open flags. The call is Linux-only, inside `#ifndef CYRIUS_TARGET_AGNOS`.
+
+### Changed
+
+- **Toolchain `6.6.6` → `6.6.20`.**
+  - **Vendored `lib/` re-synced.** `cyrius lib sync` copied **24/24** declared-closure files, and all of them
+    byte-match the 6.6.20 snapshot.
+  - ⚠ **`lib/poison.cyr` is new and now tracked (25 files).** `lib/alloc.cyr` includes it only under
+    `#ifdef CYRIUS_POISON`, so it is never compiled into klug. But the dependency resolver that every `cyrius build`
+    runs follows that include and vendors and locks it, while `lib sync`'s closure does not. Left untracked, every
+    fresh-clone build would dirty the tree. See *Upstream*.
+  - **No API klug calls moved.**
+  - **The 6.6.7–6.6.20 upgrade notes checked.**
+    - 6.6.20, a redefined fn binds to its LAST definition: klug defines no fn twice, and the build is warning-free.
+    - 6.6.20, `fncallN` / `sizeof` / `mulh64` reserved as definition names: klug only calls `fncall2` / `fncall3`.
+    - 6.6.17: `lib sync` before `deps`, and `[build] test` for bare `cyrius test`. CI runs neither `lib sync` nor a
+      tracked lock (`cyrius.lock` is gitignored).
+    - 6.6.10: `cyrius test` now grades the LAST `N passed, M failed` line, which klug's suite prints.
+    - 6.6.16: struct-copy semantics. klug has no structs.
+    - 6.6.13: f64 builtins. klug has no `math.cyr`.
+  - **Coverage now reads lower** (`cyrius coverage`: the 0.2.0 source at 6.6.20 reads 63%, not 75%) because 6.6.8
+    stopped counting mentions inside comments. At 0.2.1 it reads 10/15 (66%). The five unreferenced fns are the I/O
+    shell (`klug_dump`, `klug_usage`, `klug_err_line`, `klug_stdout_write`, `klug_fd_read`), which CI's smoke step
+    executes.
+  - **Most of the size growth is unreachable stdlib code**: host +18 KB, agnos +32 KB. DCE (`[build] dce = true`,
+    6.6.17) was not adopted in this patch; that is a separate decision.
+- `klug_emit` is now `klug_emit_lines` (filter and write; returns the tagged-line count or −1) followed by
+  `klug_emit_done` (the stderr verdict and the exit code). The drain sums tags across batches and judges once. The
+  existing `klug_emit` contract and its tests are unchanged.
+- **CI smoke: a log bigger than 64 KB must come out whole.** As root, CI now writes ~110 KB of user.info filler to
+  `/dev/kmsg`, one open per line so the per-open devkmsg ratelimit never bites, then an info, a warning and an err
+  marker LAST. It then asserts:
+  - the full dump is over 64 KB and carries all three markers;
+  - `-w` carries the warning and the err but not the info;
+  - `-e` carries the err but not the warning.
+
+  Dry-run against a fake `/dev/kmsg`: passes on correct output, and fails both on the 0.2.0 oldest-64-KB cut and on
+  a leaked marker. The `-e may be EMPTY` caveat is gone, because the err marker guarantees a non-empty `-e`.
+
+### Added
+
+- **11 tests, 57 assertions**: 10 drain tests, plus one for the `klug_emit_lines` / `klug_emit_done` split. The fake reader refuses a
+  record that does not fit, exactly as `devkmsg_read` does. Covered:
+  - a log bigger than the buffer arrives whole, in order (3 batches → 3 writes);
+  - no read is offered less than a worst-case record, and one of exactly that size lands at the tightest offer;
+  - `-e` / `-w` across batches keep an err's continuation line and coalesce within a batch;
+  - `-EAGAIN` and 0 end the log, and an empty log writes nothing;
+  - `-EPIPE` is a gap, not the end;
+  - `-EINTR` retries at the same offset;
+  - `-EIO` emits what was read and exits 1;
+  - `-EPIPE` / `-EINTR` forever stop at exactly `KLUG_STALL_MAX + 1` reads, and a record resets the count;
+  - a write failure stops the drain with no further reads;
+  - the production constants.
+
+  **Mutation-checked**: nine mutants each redden 1–15 rows. They are: fill the buffer to the brim, stop when it is
+  full (the 0.2.0 bug), `-EPIPE` ends the log, `-EINTR` ends the log, no stall reset, keep reading after a write
+  failure, `-EIO` treated as end of log, no final flush, and no buffer reset.
+
+### Upstream (cyrius) — found during the bump, not klug's to fix
+
+- 6.6.20 `cyrius lib sync --dry-run` prints raw pointers (`would sync: 139831986457200`) instead of file names. This
+  is already filed upstream, as item 5 of `docs/development/issues/2026-10-08-cli-path-and-reporting-leftovers.md`.
+- `cyrius lib sync` (24 files) and the build's dependency resolver (25: + `poison.cyr`) disagree on the closure of a
+  conditional include (`alloc.cyr`'s `#ifdef CYRIUS_POISON`). This is not yet filed.
+- Proposal filed: `docs/development/proposals/2026-10-13-adjacent-string-literal-concatenation.md`, making
+  `"abc" "def"` lex as one literal. It would retire `_cat` above, the 536 `#skip-lint` code lines across the
+  ecosystem that hold a literal, and the long-literal column warnings.
+
 ## [0.2.0] - 2026-09-21 (the lens works on the dev host; the write loop is tested, not trusted)
 
 The first minor since 0.1.0. No toolchain move (still 6.6.6); every change is klug's own. Tests

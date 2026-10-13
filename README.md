@@ -27,8 +27,13 @@ sudo klug -e          # Linux dev host: err-and-worse records from /dev/kmsg
 - **Linux** (dev-host dogfooding): reads `/dev/kmsg` so the tool runs and is
   testable off-target. Records are dumped as the raw wire format the kernel
   hands out (`PRI,SEQ,TS,FLAG;msg`, plus ` KEY=VALUE` continuation lines on
-  device records) — klug does not reformat. Since 0.2.0 the severity lens works
-  here too, off each record's syslog priority (below).
+  device records) — klug does not reformat. The whole log is dumped, however
+  big: it is streamed through the 64 KB buffer a batch at a time (through 0.2.0
+  klug stopped when the buffer filled, so on a host with more than 64 KB of log
+  the newest records were silently missing). If the kernel overwrites records
+  faster than klug reads them, klug carries on and says on stderr that the dump
+  has a gap. Since 0.2.0 the severity lens works here too, off each record's
+  syslog priority (below).
 
 The severity lens (`-w`/`-e`) keys off the `[I]`/`[W]`/`[E]` prefixes the kernel
 emits. Unprefixed lines — boot output and raw `kprintln`, which is most of an AGNOS
@@ -69,9 +74,12 @@ cyrius test tests/klug.tcyr                    # tests
 
 The suite runs in-process on the host and covers both lenses, the short-write loop
 under both targets' zero-return policies (the AGNOS pipe-backpressure arm included —
-driven through a scripted writer, so it no longer needs iron to execute), and the
-filter over a whole log, byte-exact. CI additionally executes the host binary as
-root against the runner's real `/dev/kmsg`.
+driven through a scripted writer, so it no longer needs iron to execute), the
+filter over a whole log, byte-exact, and the `/dev/kmsg` drain (a log bigger than
+the buffer, end of log, gaps, retries and failed reads, through a scripted reader).
+CI additionally executes the host binary as root against the runner's real
+`/dev/kmsg`, after writing more than 64 KB into it, and checks that the newest
+records come out.
 
 On AGNOS, klug is staged onto the agnos-fs `/bin` via `agnos/scripts/burn/stage-tools.sh`
 and run through the shell's exec-from-disk path.
@@ -101,9 +109,10 @@ console-bound:
 run /bin/klug | grep panic    # fine — only the matches hit the console
 ```
 
-This is a kernel-side property, not a klug bug, and it is tracked on the agnos
-side (`docs/development/state.md`, and the `run /bin/klug > /f.txt` note at
-`kernel/core/syscall.cyr:442`). `klug --help` repeats the warning on AGNOS builds.
+This is a kernel-side property, not a klug bug. agnos records it as unfixed by
+decision (`docs/development/state.md`, since 1.56.48), and its fault path carries
+the same `run /bin/klug > /f.txt` note (`kernel/core/syscall.cyr`,
+`fault_kill_current`). `klug --help` repeats the warning on AGNOS builds.
 
 ## License
 

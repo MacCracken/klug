@@ -72,10 +72,18 @@ jobs:
         #     record `-e` emits level <= 3 (PRI is the field before the first
         #     comma; `PRI % 8` is the level). Continuation lines start with a
         #     space, inherit their record's level, and are skipped by the check.
-        #     `-e` may legitimately be EMPTY on a clean boot, so the assertion is
-        #     on what is emitted, never on how much — plus -e ⊆ -w ⊆ full by
-        #     line count, which holds because all three reads cover the same
-        #     first 64 KB of records.
+        #     The assertion is on what is emitted, never on how much — plus
+        #     -e ⊆ -w ⊆ full by line count. The three reads run back to back over
+        #     the same log, and the filler below puts hundreds of info lines
+        #     between the counts, so a runner logging in between cannot invert them.
+        #   · ⛔ the 0.2.1 row — a log BIGGER than klug's 64 KB buffer comes out
+        #     WHOLE. Through 0.2.0 the Linux reader stopped when its buffer filled,
+        #     so the NEWEST records were dropped and klug exited 0. Write ~110 KB of
+        #     user.info filler to /dev/kmsg (one open per line, so the per-open
+        #     devkmsg ratelimit — 10 per 5 s — never bites), then three markers
+        #     LAST: the full dump must be over 64 KB and carry all three, `-w` the
+        #     warning and the err but not the info, `-e` only the err. Before 0.2.1
+        #     the markers sit past the cut, and this row fails.
         run: |
           set -eu
           ./build/klug --help > help.txt
@@ -91,6 +99,10 @@ jobs:
           else
             test "$rc" = 0
           fi
+          pad='................................................................................................................................................'
+          sudo sh -c 'i=0; while [ $i -lt 600 ]; do echo "<14>klug-ci filler $i $1" > /dev/kmsg || exit 1; i=$((i+1)); done' sh "$pad" \
+            || { echo "::error::cannot write /dev/kmsg on this runner (printk.devkmsg=off?)"; exit 1; }
+          sudo sh -c 'echo "<14>klug-ci marker info" > /dev/kmsg && echo "<12>klug-ci marker warning" > /dev/kmsg && echo "<11>klug-ci marker err" > /dev/kmsg'
           sudo ./build/klug > full.txt
           test -s full.txt
           sudo ./build/klug -w > warn.txt
@@ -99,4 +111,13 @@ jobs:
           awk -F, '/^ / { next } { if (($1 % 8) > 3) { print "not an error: " $0; bad = 1 } } END { exit bad + 0 }' errs.txt
           test "$(wc -l < errs.txt)" -le "$(wc -l < warn.txt)"
           test "$(wc -l < warn.txt)" -le "$(wc -l < full.txt)"
-          echo "smoke: full=$(wc -l < full.txt) lines, -w=$(wc -l < warn.txt), -e=$(wc -l < errs.txt)"
+          test "$(wc -c < full.txt)" -gt 65536
+          grep -q ';klug-ci marker info$' full.txt
+          grep -q ';klug-ci marker warning$' full.txt
+          grep -q ';klug-ci marker err$' full.txt
+          grep -q ';klug-ci marker warning$' warn.txt
+          grep -q ';klug-ci marker err$' warn.txt
+          if grep -q ';klug-ci marker info$' warn.txt; then echo "-w leaked the info marker"; exit 1; fi
+          grep -q ';klug-ci marker err$' errs.txt
+          if grep -q ';klug-ci marker warning$' errs.txt; then echo "-e leaked the warning marker"; exit 1; fi
+          echo "smoke: full=$(wc -l < full.txt) lines / $(wc -c < full.txt) B, -w=$(wc -l < warn.txt), -e=$(wc -l < errs.txt)"

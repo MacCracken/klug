@@ -10,7 +10,10 @@
 #     dev-kmsg record format (syslog priority, continuation lines);
 #   · the write loop, `klug_write_loop`, driven through a scripted fake writer so
 #     every short-write / zero / errno arm of BOTH targets' policies runs here —
-#     including the agnos backpressure arm, which used to run only on iron.
+#     including the agnos backpressure arm, which used to run only on iron;
+#   · the /dev/kmsg drain, `klug_kmsg_drain`, driven through a scripted fake reader
+#     that refuses a record that does not fit exactly as devkmsg_read does — so a log
+#     bigger than the buffer, -EAGAIN / -EPIPE / -EINTR and a failed read all run here.
 
 include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
@@ -142,6 +145,14 @@ fn _kpri(s): i64 {
     return klug_kmsg_pri_level(s, strlen(s));
 }
 
+fn _kline(s, prev): i64 {
+    return klug_line_level(s, strlen(s), KLUG_SRC_KMSG, prev);
+}
+
+fn _rline(s, prev): i64 {
+    return klug_line_level(s, strlen(s), KLUG_SRC_RING, prev);
+}
+
 fn test_kmsg_priority_maps_to_level() {
     # syslog level = pri & 7: 0 emerg · 1 alert · 2 crit · 3 err · 4 warning · 5 notice · 6 info ·
     # 7 debug. -e keeps <= 3, -w keeps <= 4 — the same slice `dmesg --level` makes.
@@ -191,15 +202,15 @@ fn test_kmsg_continuation_lines_inherit_their_record() {
     # The kernel appends " KEY=VALUE" dictionary lines to dev_printk records (" SUBSYSTEM=usb",
     # " DEVICE=+usb:1-2"). They carry no priority; per line they would score ALL and `klug -e`
     # would strip an error's context. klug_line_level hands them the previous header's level.
-    assert(klug_line_level(" SUBSYSTEM=usb\n", 15, KLUG_SRC_KMSG, KLUG_LVL_ERR) == KLUG_LVL_ERR, "continuation after an err -> ERR");
-    assert(klug_line_level(" DEVICE=+usb:1-2\n", 17, KLUG_SRC_KMSG, KLUG_LVL_WARN) == KLUG_LVL_WARN, "continuation after a warning -> WARN");
-    assert(klug_line_level(" SUBSYSTEM=usb\n", 15, KLUG_SRC_KMSG, KLUG_LVL_ALL) == KLUG_LVL_ALL, "continuation after info -> ALL");
+    assert(_kline(" SUBSYSTEM=usb\n", KLUG_LVL_ERR) == KLUG_LVL_ERR, "continuation after an err -> ERR");
+    assert(_kline(" DEVICE=+usb:1-2\n", KLUG_LVL_WARN) == KLUG_LVL_WARN, "continuation after a warning -> WARN");
+    assert(_kline(" SUBSYSTEM=usb\n", KLUG_LVL_ALL) == KLUG_LVL_ALL, "continuation after info -> ALL");
     # A header never inherits: its own priority wins over whatever came before.
-    assert(klug_line_level("6,1,2,-;x\n", 10, KLUG_SRC_KMSG, KLUG_LVL_ERR) == KLUG_LVL_ALL, "info header after an err -> ALL (own priority)");
-    assert(klug_line_level("3,1,2,-;x\n", 10, KLUG_SRC_KMSG, KLUG_LVL_ALL) == KLUG_LVL_ERR, "err header after info -> ERR (own priority)");
+    assert(_kline("6,1,2,-;x\n", KLUG_LVL_ERR) == KLUG_LVL_ALL, "info header after an err -> ALL (own priority)");
+    assert(_kline("3,1,2,-;x\n", KLUG_LVL_ALL) == KLUG_LVL_ERR, "err header after info -> ERR (own priority)");
     # Not a record and not a continuation: plain ALL, prev is not consulted.
-    assert(klug_line_level("garbage\n", 8, KLUG_SRC_KMSG, KLUG_LVL_ERR) == KLUG_LVL_ALL, "garbage after an err -> ALL");
-    assert(klug_line_level("", 0, KLUG_SRC_KMSG, KLUG_LVL_ERR) == KLUG_LVL_ALL, "empty after an err -> ALL");
+    assert(_kline("garbage\n", KLUG_LVL_ERR) == KLUG_LVL_ALL, "garbage after an err -> ALL");
+    assert(_kline("", KLUG_LVL_ERR) == KLUG_LVL_ALL, "empty after an err -> ALL");
     return 0;
 }
 
@@ -218,8 +229,8 @@ fn test_lens_is_per_source_not_per_byte() {
     assert(_level("[E] disk error\n") == KLUG_LVL_ERR, "RING: [E] -> ERR (unchanged)");
     # A leading space is a continuation ONLY on /dev/kmsg. Ring-3 output that indents itself is
     # not continuing the kernel line above it.
-    assert(klug_line_level("  indented ring-3 output\n", 25, KLUG_SRC_RING, KLUG_LVL_ERR) == KLUG_LVL_ALL, "RING: leading space never inherits");
-    assert(klug_line_level("[E] x\n", 6, KLUG_SRC_RING, KLUG_LVL_ALL) == KLUG_LVL_ERR, "RING: line_level is level_of");
+    assert(_rline("  indented ring-3 output\n", KLUG_LVL_ERR) == KLUG_LVL_ALL, "RING: leading space never inherits");
+    assert(_rline("[E] x\n", KLUG_LVL_ALL) == KLUG_LVL_ERR, "RING: line_level is level_of");
     assert(KLUG_SRC_RING != KLUG_SRC_KMSG, "the two sources are distinct");
     return 0;
 }
@@ -455,6 +466,16 @@ fn _sink_is(expected): i64 {
     return memeq(&_wr_sink, expected, n);
 }
 
+var _cat_buf[64];        # 512 B: a test log assembled from two literals, so no line passes 120 columns
+
+fn _cat(a, b): i64 {
+    var na = strlen(a);
+    memset(&_cat_buf, 0, 512);
+    memcpy(&_cat_buf, a, na);
+    memcpy(&_cat_buf + na, b, strlen(b));
+    return &_cat_buf;
+}
+
 fn test_emit_unfiltered_is_one_write_of_everything() {
     var log = "6,1,100,-;boot ok\n3,2,200,-;disk error\n SUBSYSTEM=block\n4,3,300,-;low memory\n";
     assert_eq(_emit(KLUG_LVL_ALL, log, KLUG_SRC_KMSG), 0, "bare dump -> 0");
@@ -469,9 +490,11 @@ fn test_emit_kmsg_err_keeps_a_record_with_its_continuations() {
     # -e over a /dev/kmsg log: the err record AND its dictionary lines, nothing else. The
     # continuation state is threaded through the loop here — a per-line lens alone would
     # drop " SUBSYSTEM=block" as level 0 and hand the operator an error with no device.
-    var log = "6,1,100,-;boot ok\n3,2,200,-;disk error\n SUBSYSTEM=block\n DEVICE=+block:sda\n4,3,300,-;low memory\n6,4,400,-;fine\n";
+    var log = _cat("6,1,100,-;boot ok\n3,2,200,-;disk error\n SUBSYSTEM=block\n DEVICE=+block:sda\n",
+      "4,3,300,-;low memory\n6,4,400,-;fine\n");
     assert_eq(_emit(KLUG_LVL_ERR, log, KLUG_SRC_KMSG), 0, "-e -> 0");
-    assert_eq(_sink_is("3,2,200,-;disk error\n SUBSYSTEM=block\n DEVICE=+block:sda\n"), 1, "-e: the err record + both continuations, nothing else");
+    assert_eq(_sink_is("3,2,200,-;disk error\n SUBSYSTEM=block\n DEVICE=+block:sda\n"), 1,
+      "-e: the err record + both continuations, nothing else");
     assert_eq(_wr_calls, 1, "-e: one contiguous run -> one write");
     return 0;
 }
@@ -480,9 +503,11 @@ fn test_emit_kmsg_warn_coalesces_adjacent_passing_lines() {
     # -w: err + warning records. An info record between two passing runs splits them into
     # two writes; adjacent passing lines (a record and its continuation, or two records in a
     # row) go out together.
-    var log = "6,1,100,-;boot ok\n3,2,200,-;disk error\n SUBSYSTEM=block\n6,3,300,-;fine\n4,4,400,-;low memory\n4,5,500,-;still low\n6,6,600,-;fine again\n";
+    var log = _cat("6,1,100,-;boot ok\n3,2,200,-;disk error\n SUBSYSTEM=block\n6,3,300,-;fine\n",
+      "4,4,400,-;low memory\n4,5,500,-;still low\n6,6,600,-;fine again\n");
     assert_eq(_emit(KLUG_LVL_WARN, log, KLUG_SRC_KMSG), 0, "-w -> 0");
-    assert_eq(_sink_is("3,2,200,-;disk error\n SUBSYSTEM=block\n4,4,400,-;low memory\n4,5,500,-;still low\n"), 1, "-w: err+continuation, then both warnings; infos dropped");
+    assert_eq(_sink_is("3,2,200,-;disk error\n SUBSYSTEM=block\n4,4,400,-;low memory\n4,5,500,-;still low\n"), 1,
+      "-w: err+continuation, then both warnings; infos dropped");
     assert_eq(_wr_calls, 2, "-w: two runs (split by the info record) -> two writes");
     # A continuation after a DROPPED record is dropped with it.
     var log2 = "6,1,100,-;usb 1-2: new device\n SUBSYSTEM=usb\n DEVICE=+usb:1-2\n4,2,200,-;low memory\n";
@@ -494,9 +519,11 @@ fn test_emit_kmsg_warn_coalesces_adjacent_passing_lines() {
 fn test_emit_ring_warn_is_the_agnos_lens() {
     # The same loop under the ring source: [W]/[E] pass (prefixed or not), plain kprintln and
     # ring-3 lines drop, and a leading space is NOT a continuation here.
-    var log = "[    1.000000] [I] booting\n[W] low memory\nplain kprintln line\n  indented ring-3 output\n[    5.000000] [E] disk error\n[E] again\n";
+    var log = _cat("[    1.000000] [I] booting\n[W] low memory\nplain kprintln line\n  indented ring-3 output\n",
+      "[    5.000000] [E] disk error\n[E] again\n");
     assert_eq(_emit(KLUG_LVL_WARN, log, KLUG_SRC_RING), 0, "ring -w -> 0");
-    assert_eq(_sink_is("[W] low memory\n[    5.000000] [E] disk error\n[E] again\n"), 1, "ring -w: the [W] and both [E]s, plain + indented lines dropped");
+    assert_eq(_sink_is("[W] low memory\n[    5.000000] [E] disk error\n[E] again\n"), 1,
+      "ring -w: the [W] and both [E]s, plain + indented lines dropped");
     assert_eq(_wr_calls, 2, "ring -w: two runs -> two writes");
     assert_eq(_emit(KLUG_LVL_ERR, log, KLUG_SRC_RING), 0, "ring -e -> 0");
     assert_eq(_sink_is("[    5.000000] [E] disk error\n[E] again\n"), 1, "ring -e: only the [E]s");
@@ -509,7 +536,8 @@ fn test_emit_trailing_partial_line_is_filtered_too() {
     # terminator): the trailing fragment goes through the same lens and the same run.
     var log = "6,1,100,-;boot ok\n3,2,200,-;disk error\n SUBSYSTEM=block";
     assert_eq(_emit(KLUG_LVL_ERR, log, KLUG_SRC_KMSG), 0, "-e with a partial tail -> 0");
-    assert_eq(_sink_is("3,2,200,-;disk error\n SUBSYSTEM=block"), 1, "-e: the partial continuation inherits and is kept");
+    assert_eq(_sink_is("3,2,200,-;disk error\n SUBSYSTEM=block"), 1,
+      "-e: the partial continuation inherits and is kept");
     assert_eq(_wr_calls, 1, "-e: record + partial continuation -> one write");
     var log2 = "3,1,100,-;disk error\n6,2,200,-;fine";
     assert_eq(_emit(KLUG_LVL_ERR, log2, KLUG_SRC_KMSG), 0, "-e with a dropped partial tail -> 0");
@@ -540,6 +568,267 @@ fn test_emit_write_failure_stops_and_reports_one() {
     assert_eq(rc, 1, "write failure -> 1");
     assert_eq(_wr_calls, 2, "write failure: no further runs are attempted");
     assert_eq(_wr_sunk, 11, "write failure: only the accepted prefix reached stdout");
+    return 0;
+}
+
+# ── /dev/kmsg drain: the whole log, batch by batch ───────────────────────────────
+#
+# A scripted fake reader stands in for read(/dev/kmsg). Each call returns the next step: a
+# record (copied into the offered buffer — or refused with -EINVAL when it does not fit, which is
+# what devkmsg_read does) or a negative errno (0 is returned as-is). Past the script it returns
+# -EAGAIN: caught up. The output side is the fake writer, so each test states the exact stdout
+# bytes. The drain runs on a 96-byte buffer with KLUG_KMSG_REC_MAX lowered to 32, so a batch is
+# flushed once more than 64 bytes are in it — 5 of the 13-byte records below.
+
+var _rd_script[32];      # per call: a record (cstring pointer) or an errno (<= 0)
+var _rd_len = 0;
+var _rd_const_on = 0;    # 1: ignore the script, return _rd_const on EVERY call
+var _rd_const = 0;
+var _rd_calls = 0;
+var _rd_min_offer = 0;   # the smallest `len` any read was offered
+var _rd_bad_fd = 0;      # set if a read went to any fd but the one the drain was handed
+var _rd_buf[12];         # the drain's 96-byte batch buffer
+var _rd_all[64];         # 512 B: every scripted record, in order — what a bare dump must print
+var _rd_all_len = 0;
+
+fn _rd_reset(): i64 {
+    _wr_reset(0);
+    _wr_strict = 0;
+    _rd_len = 0; _rd_const_on = 0; _rd_const = 0; _rd_calls = 0;
+    _rd_min_offer = 1000000; _rd_bad_fd = 0; _rd_all_len = 0;
+    memset(&_rd_all, 0, 512);
+    return 0;
+}
+
+fn _rd_push(step): i64 {
+    store64(&_rd_script + _rd_len * 8, step);
+    _rd_len = _rd_len + 1;
+    if (step > 0) {
+        var n = strlen(step);
+        memcpy(&_rd_all + _rd_all_len, step, n);
+        _rd_all_len = _rd_all_len + n;
+    }
+    return 0;
+}
+
+fn _rd_always(r): i64 {
+    _rd_const_on = 1;
+    _rd_const = r;
+    return 0;
+}
+
+fn _fake_reader(fd, p, len): i64 {
+    if (fd != 7) { _rd_bad_fd = 1; }
+    if (len < _rd_min_offer) { _rd_min_offer = len; }
+    var i = _rd_calls;
+    _rd_calls = _rd_calls + 1;
+    var step = KLUG_EAGAIN;                             # past the script: caught up
+    if (_rd_const_on == 1) { step = _rd_const; }
+    else { if (i < _rd_len) { step = load64(&_rd_script + i * 8); } }
+    if (step <= 0) { return step; }
+    var n = strlen(step);
+    if (n > len) { return 0 - 22; }                     # -EINVAL: devkmsg_read refuses (and loses) it
+    memcpy(p, step, n);
+    return n;
+}
+
+fn _drain(min_level): i64 {
+    var saved = KLUG_KMSG_REC_MAX;
+    KLUG_KMSG_REC_MAX = 32;
+    var rc = klug_kmsg_drain(&_fake_reader, 7, &_rd_buf, 96, min_level, &_fake_writer, KLUG_WR_LINUX);
+    KLUG_KMSG_REC_MAX = saved;
+    return rc;
+}
+
+# The first `n` bytes of the scripted records — and nothing else — reached stdout.
+fn _sink_is_first(n): i64 {
+    if (_wr_sunk != n) { return 0; }
+    return memeq(&_wr_sink, &_rd_all, n);
+}
+
+fn _rd_twelve(): i64 {   # twelve 13-byte info records: 156 B, more than the 96-byte buffer
+    _rd_push("6,1,10,-;a01\n"); _rd_push("6,1,10,-;a02\n"); _rd_push("6,1,10,-;a03\n");
+    _rd_push("6,1,10,-;a04\n"); _rd_push("6,1,10,-;a05\n"); _rd_push("6,1,10,-;a06\n");
+    _rd_push("6,1,10,-;a07\n"); _rd_push("6,1,10,-;a08\n"); _rd_push("6,1,10,-;a09\n");
+    _rd_push("6,1,10,-;a10\n"); _rd_push("6,1,10,-;a11\n"); _rd_push("6,1,10,-;a12\n");
+    return 0;
+}
+
+fn test_drain_dumps_a_log_bigger_than_the_buffer() {
+    # ⛔ THE 0.2.1 FIX. Through 0.2.0 the Linux arm read until its buffer was full and stopped: on a
+    # host whose /dev/kmsg held more than 64 KB, the NEWEST records never reached stdout and klug
+    # exited 0. Twelve records (156 B) through a 96-byte buffer must all arrive, in order.
+    _rd_reset(); _rd_twelve();
+    assert_eq(_drain(KLUG_LVL_ALL), 0, "a log bigger than the buffer -> 0");
+    assert_eq(_sink_is(&_rd_all), 1, "every record reached stdout, in order — the newest included");
+    assert_eq(_rd_calls, 13, "twelve records + the -EAGAIN that ends the log");
+    assert_eq(_wr_calls, 3, "three batches (5 + 5 + 2 records) -> three writes");
+    assert_eq(_rd_bad_fd, 0, "every read went to the fd the drain was handed");
+    return 0;
+}
+
+fn test_drain_never_offers_less_than_a_record() {
+    # A read offered less than the next record loses it (devkmsg_read: -EINVAL, AFTER advancing past
+    # it). So every offer is >= KLUG_KMSG_REC_MAX, and a record of exactly that size still lands at
+    # the tightest point: four 16-byte records leave 32 of 96 bytes, and the 32-byte record fits.
+    _rd_reset(); _rd_twelve();
+    _drain(KLUG_LVL_ALL);
+    assert(_rd_min_offer >= 32, "no read was offered less than a worst-case record");
+    _rd_reset();
+    _rd_push("6,1,10,-;abcdef\n"); _rd_push("6,1,10,-;bcdefg\n");
+    _rd_push("6,1,10,-;cdefgh\n"); _rd_push("6,1,10,-;defghi\n");
+    _rd_push("6,1,10,-;abcdefghijklmnopqrstuv\n");
+    assert_eq(_drain(KLUG_LVL_ALL), 0, "a worst-case record at the tightest offer -> 0");
+    assert_eq(_sink_is(&_rd_all), 1, "... and it was delivered whole");
+    assert(_rd_min_offer >= 32, "... from an offer of at least a worst-case record");
+    return 0;
+}
+
+fn test_drain_filters_across_batches() {
+    # The lens runs per batch, and a batch ends on a record boundary (one read = one record + its
+    # continuation lines), so an err record keeps its dictionary line and batches change nothing
+    # about WHICH bytes are selected — only how many writes carry them.
+    _rd_reset();
+    _rd_push("6,1,10,-;a01\n"); _rd_push("6,1,10,-;a02\n"); _rd_push("6,1,10,-;a03\n");
+    _rd_push("3,1,10,-;e04\n SUBSYSTEM=x\n");          # one read: the record and its continuation
+    _rd_push("6,1,10,-;a05\n"); _rd_push("6,1,10,-;a06\n");
+    _rd_push("4,1,10,-;w07\n"); _rd_push("3,1,10,-;e08\n");
+    assert_eq(_drain(KLUG_LVL_ERR), 0, "-e across batches -> 0");
+    assert_eq(_sink_is("3,1,10,-;e04\n SUBSYSTEM=x\n3,1,10,-;e08\n"), 1, "-e: both errs, the continuation kept");
+    assert_eq(_wr_calls, 2, "-e: one run per batch -> two writes");
+    _rd_reset();
+    _rd_push("6,1,10,-;a01\n"); _rd_push("6,1,10,-;a02\n"); _rd_push("6,1,10,-;a03\n");
+    _rd_push("3,1,10,-;e04\n SUBSYSTEM=x\n");
+    _rd_push("6,1,10,-;a05\n"); _rd_push("6,1,10,-;a06\n");
+    _rd_push("4,1,10,-;w07\n"); _rd_push("3,1,10,-;e08\n");
+    assert_eq(_drain(KLUG_LVL_WARN), 0, "-w across batches -> 0");
+    assert_eq(_sink_is("3,1,10,-;e04\n SUBSYSTEM=x\n4,1,10,-;w07\n3,1,10,-;e08\n"), 1,
+      "-w: the err + continuation, then the adjacent warning and err");
+    assert_eq(_wr_calls, 2, "-w: adjacent records in the second batch coalesce -> two writes");
+    return 0;
+}
+
+fn test_drain_eagain_and_zero_end_the_log() {
+    _rd_reset(); _rd_push("6,1,10,-;a01\n"); _rd_push("6,1,10,-;a02\n");
+    assert_eq(_drain(KLUG_LVL_ALL), 0, "-EAGAIN after two records -> 0");
+    assert_eq(_sink_is(&_rd_all), 1, "-EAGAIN: both records delivered");
+    assert_eq(_rd_calls, 3, "-EAGAIN: no read after it");
+    _rd_reset(); _rd_push("6,1,10,-;a01\n"); _rd_push(0); _rd_push("6,1,10,-;a02\n");
+    assert_eq(_drain(KLUG_LVL_ALL), 0, "0 (EOF) -> 0");
+    assert_eq(_sink_is("6,1,10,-;a01\n"), 1, "0 ends the log: nothing after it is read");
+    assert_eq(_rd_calls, 2, "0: no read after it");
+    _rd_reset();
+    assert_eq(_drain(KLUG_LVL_ALL), 0, "an empty log -> 0");
+    assert_eq(_wr_calls, 0, "an empty log writes nothing");
+    return 0;
+}
+
+fn test_drain_epipe_is_a_gap_not_the_end() {
+    # -EPIPE: the kernel overwrote records this reader had not reached. Through 0.2.0 it ENDED the
+    # dump there, silently, exit 0. Now the drain carries on from the oldest survivor (as dmesg does)
+    # and says on stderr that the dump has a gap (printed during this test, not captured); the exit
+    # stays 0 because the log lost those records, not klug.
+    _rd_reset();
+    _rd_push("6,1,10,-;a01\n"); _rd_push(KLUG_EPIPE); _rd_push("6,1,10,-;a02\n");
+    _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push("6,1,10,-;a03\n");
+    assert_eq(_drain(KLUG_LVL_ALL), 0, "-EPIPE -> 0, and the drain goes on");
+    assert_eq(_sink_is(&_rd_all), 1, "-EPIPE: every record after the gap delivered");
+    assert_eq(_rd_calls, 7, "-EPIPE: one re-read per -EPIPE");
+    return 0;
+}
+
+fn test_drain_eintr_retries() {
+    _rd_reset();
+    _rd_push(KLUG_EINTR); _rd_push("6,1,10,-;a01\n"); _rd_push(KLUG_EINTR); _rd_push("6,1,10,-;a02\n");
+    assert_eq(_drain(KLUG_LVL_ALL), 0, "-EINTR -> 0");
+    assert_eq(_sink_is(&_rd_all), 1, "-EINTR: the retry reads into the same offset");
+    assert_eq(_rd_calls, 5, "-EINTR: one retry each");
+    return 0;
+}
+
+fn test_drain_read_failure_emits_what_was_read_and_fails() {
+    # Any other errno is a real failure (-EIO here). The records before it are real, so they are
+    # still dumped — across a batch flush — but the exit code says the dump is INCOMPLETE.
+    _rd_reset();
+    _rd_push("6,1,10,-;a01\n"); _rd_push("6,1,10,-;a02\n"); _rd_push("6,1,10,-;a03\n");
+    _rd_push("6,1,10,-;a04\n"); _rd_push("6,1,10,-;a05\n"); _rd_push("6,1,10,-;a06\n");
+    _rd_push(0 - 5);
+    _rd_push("6,1,10,-;a07\n");
+    assert_eq(_drain(KLUG_LVL_ALL), 1, "-EIO -> 1");
+    assert_eq(_sink_is_first(78), 1, "-EIO: the six records before it delivered, nothing after");
+    assert_eq(_rd_calls, 7, "-EIO: no read after it");
+    assert_eq(_wr_calls, 2, "-EIO: the batch flushed before it and the partial batch");
+    return 0;
+}
+
+fn test_drain_retries_are_bounded() {
+    # A reader that never yields a record (-EPIPE or -EINTR forever) must not spin klug forever.
+    # Same bound and shape as the agnos write stall: the retry that finds KLUG_STALL_MAX consecutive
+    # misses fails, so MAX + 1 reads are made — and a record in between resets the count.
+    var saved = KLUG_STALL_MAX;
+    KLUG_STALL_MAX = 5;
+    _rd_reset(); _rd_always(KLUG_EPIPE);
+    assert_eq(_drain(KLUG_LVL_ALL), 1, "-EPIPE forever -> 1");
+    assert_eq(_rd_calls, 6, "-EPIPE forever: exactly KLUG_STALL_MAX + 1 reads");
+    _rd_reset(); _rd_always(KLUG_EINTR);
+    assert_eq(_drain(KLUG_LVL_ALL), 1, "-EINTR forever -> 1");
+    assert_eq(_rd_calls, 6, "-EINTR forever: exactly KLUG_STALL_MAX + 1 reads");
+    _rd_reset();
+    _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE);
+    _rd_push("6,1,10,-;a01\n");
+    _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE);
+    _rd_push("6,1,10,-;a02\n");
+    assert_eq(_drain(KLUG_LVL_ALL), 0, "5 misses, a record, 5 misses, a record -> 0");
+    assert_eq(_sink_is(&_rd_all), 1, "a record resets the bound: both delivered");
+    _rd_reset();
+    _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE);
+    _rd_push("6,1,10,-;a01\n");
+    _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE); _rd_push(KLUG_EPIPE);
+    _rd_push(KLUG_EPIPE);
+    assert_eq(_drain(KLUG_LVL_ALL), 1, "a sixth consecutive miss trips the bound");
+    assert_eq(_rd_calls, 12, "tripped on the 6th miss after the record");
+    assert_eq(_sink_is("6,1,10,-;a01\n"), 1, "what was read before the bound is still delivered");
+    KLUG_STALL_MAX = saved;
+    return 0;
+}
+
+fn test_drain_write_failure_stops_reading() {
+    # A write failure at a batch flush ends the drain AT ONCE — no further reads, exit 1. Reading on
+    # and writing a later batch would put a hole in the middle of the dump (the 0.1.5 shape).
+    _rd_reset(); _rd_twelve();
+    _wr_push(0 - 32);                                   # -EPIPE on the first flush
+    assert_eq(_drain(KLUG_LVL_ALL), 1, "write failure mid-drain -> 1");
+    assert_eq(_rd_calls, 5, "write failure: the five records of batch one, and no read after the flush");
+    assert_eq(_wr_calls, 1, "write failure: no later batch is written");
+    assert_eq(_wr_sunk, 0, "write failure: nothing reached stdout");
+    return 0;
+}
+
+fn test_drain_production_constants() {
+    assert_eq(KLUG_KMSG_REC_MAX, 8192, "a /dev/kmsg record is at most CONSOLE_EXT_LOG_MAX = 8192 B");
+    assert(KLUG_RING_BYTES >= KLUG_KMSG_REC_MAX * 4, "the 64 KB buffer holds several worst-case records");
+    assert_eq(KLUG_EAGAIN, 0 - 11, "EAGAIN is -11");
+    assert_eq(KLUG_EPIPE, 0 - 32, "EPIPE is -32");
+    return 0;
+}
+
+fn test_emit_lines_counts_tags_and_reports_failure() {
+    # klug_emit_lines is klug_emit without the verdict: it returns the tagged-line count (summed by
+    # the drain across batches) or -1 on a write failure; klug_emit_done turns that into the exit code.
+    _wr_reset(0); _wr_strict = 0;
+    var log = "[W] a\nplain\n[E] b\n[I] c\n";
+    assert_eq(klug_emit_lines(KLUG_LVL_WARN, log, strlen(log), KLUG_SRC_RING, &_fake_writer, KLUG_WR_LINUX), 3,
+      "-w: three tagged lines counted ([W], [E], [I])");
+    _wr_reset(0); _wr_strict = 0;
+    assert_eq(klug_emit_lines(KLUG_LVL_ALL, log, strlen(log), KLUG_SRC_RING, &_fake_writer, KLUG_WR_LINUX), 0,
+      "bare dump: the fast path does not count");
+    _wr_reset(0); _wr_strict = 0; _wr_push(0 - 32);
+    assert_eq(klug_emit_lines(KLUG_LVL_WARN, log, strlen(log), KLUG_SRC_RING, &_fake_writer, KLUG_WR_LINUX), 0 - 1,
+      "write failure -> -1");
+    assert_eq(klug_emit_done(KLUG_LVL_WARN, 0 - 1, 10), 1, "verdict: a write failure exits 1");
+    assert_eq(klug_emit_done(KLUG_LVL_WARN, 3, 10), 0, "verdict: tags seen exits 0");
+    assert_eq(klug_emit_done(KLUG_LVL_ALL, 0, 10), 0, "verdict: a bare dump exits 0");
+    assert_eq(klug_emit_done(KLUG_LVL_WARN, 0, 0), 0, "verdict: an empty log exits 0");
     return 0;
 }
 
@@ -590,6 +879,19 @@ fn main(): i64 {
     test_emit_trailing_partial_line_is_filtered_too();
     test_emit_nothing_selected_is_still_exit_zero();
     test_emit_write_failure_stops_and_reports_one();
+    test_emit_lines_counts_tags_and_reports_failure();
+    test_group("klug /dev/kmsg drain — the whole log, batch by batch");
+    test_drain_dumps_a_log_bigger_than_the_buffer();
+    test_drain_never_offers_less_than_a_record();
+    test_drain_filters_across_batches();
+    test_group("klug /dev/kmsg drain — end of log, gaps, retries, failures");
+    test_drain_eagain_and_zero_end_the_log();
+    test_drain_epipe_is_a_gap_not_the_end();
+    test_drain_eintr_retries();
+    test_drain_read_failure_emits_what_was_read_and_fails();
+    test_drain_retries_are_bounded();
+    test_drain_write_failure_stops_reading();
+    test_drain_production_constants();
     return assert_summary();
 }
 
