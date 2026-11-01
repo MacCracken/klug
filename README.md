@@ -36,11 +36,22 @@ sudo klug -e          # Linux dev host: err-and-worse records from /dev/kmsg
   syslog priority (below).
 
 klug always runs. A kernel log reader is what you reach for when the box is already
-sick, so nothing about its own command line can stop it. On Linux its flags normally
-come from `/proc/self/cmdline`; with no `/proc` (a chroot, a minimal container), no free
-file descriptor or no heap, it reads them off the initial stack, where the kernel put
-them, and they work as usual. If even that fails, klug dumps the whole log, which holds
-everything a filter would have shown, and says on stderr that the flags were not applied.
+sick, so it depends on as little of the box as it can:
+
+- **Its flags** come off the initial stack, where the kernel put them, so they need no
+  `/proc`, no free file descriptor and no heap. If that ever fails klug falls back on
+  `/proc/self/cmdline`, and if that fails too it dumps the whole log, which holds
+  everything a filter would have shown, and says on stderr that the flags were not applied.
+- **The log** comes from `/dev/kmsg`. If that cannot be opened (no `/dev`, as in a chroot
+  or a minimal container, or no free file descriptor) klug reads it through `syslog(2)`,
+  which needs neither, nor `/proc`, only the privilege `/dev/kmsg` itself takes. The dump
+  is then the kernel's `<pri>[time] msg` text instead of its records, stderr says so, and
+  `-w`/`-e` read the same priority. If klug cannot get the memory to hold all of it, you
+  get the newest part, and stderr says that too.
+
+klug has no log to give you only when the kernel refuses both, which takes running
+unprivileged under `kernel.dmesg_restrict=1`. It says so and exits 1. The exit code stays
+honest about the dump, too: a read or a write that fails partway is also exit 1.
 
 The severity lens (`-w`/`-e`) keys off the `[I]`/`[W]`/`[E]` prefixes the kernel
 emits. Unprefixed lines — boot output and raw `kprintln`, which is most of an AGNOS

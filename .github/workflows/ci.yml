@@ -92,6 +92,13 @@ jobs:
         #     private mount namespace klug must read argv off the initial stack and
         #     behave exactly as it does above. `ulimit -n 3` is the same failure with
         #     no root: no free fd to open /proc/self/cmdline.
+        #   · ⛔ the 0.3.2 rows — klug RUNS with no heap and with no /dev. alloc_init
+        #     EXITS when its first mmap fails, so through 0.3.1 `ulimit -v` killed klug
+        #     before it read a byte, with no log. And a missing /dev/kmsg was exit 1,
+        #     no log: syslog(2) needs no /dev, no /proc and no free fd. With /dev covered
+        #     too the dump must come from syslog(2), be over 64 KB (klug's own buffer)
+        #     and filter correctly. `sudo ... ulimit -n 3` reaches the same arm with
+        #     /dev still there, because /dev/kmsg cannot be opened either.
         run: |
           set -eu
           ./build/klug --help > help.txt
@@ -149,4 +156,27 @@ jobs:
           grep -q ';klug-ci marker err$' np_errs.txt
           if grep -q ';klug-ci marker info$' np_warn.txt; then echo "-w was ignored with no /proc"; exit 1; fi
           if grep -q ';klug-ci marker warning$' np_errs.txt; then echo "-e was ignored with no /proc"; exit 1; fi
+          (ulimit -v 8000; ./build/klug --help) > noheap.txt
+          cmp help.txt noheap.txt
+          sudo sh -c 'ulimit -v 8000; exec ./build/klug -e' > nh_errs.txt
+          grep -q ';klug-ci marker err$' nh_errs.txt
+          if grep -q ';klug-ci marker warning$' nh_errs.txt; then echo "-e was ignored with no heap"; exit 1; fi
+          sudo unshare -m sh -eu -c '
+            mount --bind noproc /proc
+            mount --bind noproc /dev
+            test ! -e /dev/kmsg
+            ./build/klug > sl_full.txt 2> sl_full.err
+            ./build/klug -w > sl_warn.txt 2> sl_warn.err
+            ./build/klug -e > sl_errs.txt 2> sl_errs.err
+          '
+          grep -q 'syslog(2)' sl_full.err
+          test "$(wc -c < sl_full.txt)" -gt 65536
+          grep -q '^<14>.*klug-ci marker info$' sl_full.txt
+          grep -q '^<12>.*klug-ci marker warning$' sl_warn.txt
+          grep -q '^<11>.*klug-ci marker err$' sl_warn.txt
+          grep -q '^<11>.*klug-ci marker err$' sl_errs.txt
+          awk -F'[<>]' '{ if (($2 % 8) > 4) { print "not a warning: " $0; bad = 1 } } END { exit bad + 0 }' sl_warn.txt
+          awk -F'[<>]' '{ if (($2 % 8) > 3) { print "not an error: " $0; bad = 1 } } END { exit bad + 0 }' sl_errs.txt
+          sudo sh -c 'ulimit -n 3; exec ./build/klug -e' > sl_nofd.txt
+          grep -q '^<11>.*klug-ci marker err$' sl_nofd.txt
           echo "smoke: full=$(wc -l < full.txt) lines / $(wc -c < full.txt) B, -w=$(wc -l < warn.txt), -e=$(wc -l < errs.txt)"

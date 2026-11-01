@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-01 (klug reads the log with no /dev, no /proc, no heap and no free fd)
+
+klug now goes without a log only when the kernel itself refuses it. Two gaps closed: a box short of memory killed klug
+before it read anything, and a missing `/dev/kmsg` was exit 1 with no log. Tests **267 → 347**. The binaries are `build/klug`
+165,560 → 165,896 B · `build/klug_agnos` 182,320 → 182,232 B, and both reproduce byte-for-byte from a pristine copy of
+the tracked tree. The toolchain is unchanged (cyrius 6.7.18).
+
+### Fixed
+
+- ⛔ **With no heap, klug exited 1 before reading a byte, with no log.** `lib/alloc.cyr`'s `alloc_init` EXITS when its
+  first `mmap` fails; it does not return 0. `args_init` allocates, so under `ulimit -v 8000` both `klug -e` and
+  `klug --help` printed `alloc_init: mmap failed` and stopped.
+  - ⚠ **0.3.1's changelog and README said this case was handled. It was not.** Its `ENOMEM` row tested a value that
+    `args_init` does not get to return when the heap cannot start, and no test ran the case.
+  - **Fix: on Linux the initial stack now comes FIRST**, not second, so klug has its flags without touching the heap,
+    an fd or `/proc`. `lib/args.cyr` is now the fallback, reached only when the stack does not check out. That is the
+    order upstream's own proposal uses. A run makes no allocation at all.
+  - That step can still exit, but only after the stack failed too, which a compiler layout change would take, and
+    `test_init_stack_is_the_kernels` goes red at that pin bump.
+  - The frame walk now runs on every launch, so it gained `KLUG_FRAME_SPAN`: a wild `rbp` is not chased.
+
+### Added
+
+- **`syslog(2)`, when `/dev/kmsg` cannot be opened.** Through 0.3.1 that was exit 1 with no log, which a chroot or a
+  minimal container with no `/dev` would hit even as root. `syslog(2)` is a syscall, so it needs no `/dev`, no `/proc`
+  and no free fd, only the privilege `/dev/kmsg` itself takes. `klug_syslog_dump`:
+  - **dumps the whole log.** It sizes a mapping at twice `SYSLOG_ACTION_SIZE_BUFFER`, because the text outgrows the
+    ring it came from: every record gains a `<pri>[time] ` prefix. It uses a raw `mmap`, never `alloc`, which would
+    hit the same exit as above.
+  - **degrades, never stops.** A refused mapping reads into the static 64 KB buffer, and `READ_ALL` keeps the newest,
+    so that is what comes out, and stderr says so. A failed size call costs only the mapping.
+  - **says what it is.** The output is the kernel's `<pri>[time] msg` text, unreformatted, so stderr names the source.
+  - **filters.** A new lens, `KLUG_SRC_SYSLOG`, reads the same priority off the `<pri>` that opens every line.
+    `klug_pri_lens` is the slicing `/dev/kmsg` already used.
+- **CI smoke rows.** `ulimit -v 8000` with and without root; `/dev` and `/proc` both covered, where the dump must name
+  `syslog(2)`, be over 64 KB and filter correctly; and `ulimit -n 3` as root, which reaches `syslog(2)` with `/dev`
+  still there.
+- **16 tests, 80 assertions:** the lens (priorities, facilities, 13 ways of not being a record, per-source), the dump
+  (a log that fits, a log bigger than the buffer, a refused mapping, a failed size call, a refusal, an empty log, a
+  failed write) and the real fd-less and stack-first paths. **Mutation-checked**: 45 of 46 mutants redden at least one
+  row. The 46th removes `len < 3`, which is equivalent: every short input already returns -1 through the loop.
+
+### Changed
+
+- `klug --help` on Linux gains one line, naming the `syslog(2)` fallback.
+- `klug_args_recover` became `klug_args_pick`, which owns all three steps.
+- The unavailable message says that both sources failed. It still reads `kernel log unavailable`.
+
+### Verified
+
+- **On the real kernel.** The host's own 7.2.11 kernel booted in KVM from an initramfs, as root, with no sudo on the
+  host and nothing reaching its log. `ci.yml`'s Smoke step ran **verbatim** there against a real `/dev/kmsg` and a real
+  `syslog(2)`, and passed. The 0.3.1 binary fails the same run, at `alloc_init: mmap failed`.
+- **The two sources agree.** On that kernel, with `/dev/kmsg`'s `\xNN` escapes undone and its ` KEY=VAL` lines dropped,
+  the `syslog(2)` dump is identical to the `/dev/kmsg` dump, 1,010 messages of 1,010, in order. It opens at the kernel's
+  first boot line, and at 137,903 B it is the whole log, not the newest 64 KB.
+- **Everything gone at once** (no `/dev`, no `/proc`, no heap, no fd): `klug -e` prints the errors and exits 0.
+- **A mapping refused for real** (`ulimit -v 1100`): 65,450 B of the newest log, the note on stderr, exit 0.
+- **Refused for real** (uid 1000, `dmesg_restrict=1`): exit 1, nothing on stdout, and the message.
+- **A healthy run:** full, `-w`, `-e`, `-e --warn` and `--bogus` are byte-identical to 0.3.1's.
+- **agnos:** the ring lens's path is unchanged in behaviour. The compiled code moved where the lens entry points now
+  test `src != KLUG_SRC_RING` and where the `/dev/kmsg` tail became `klug_pri_lens`. The new `<pri>` parser is compiled
+  there but never reached, and `klug_args_open` is `args_init` there.
+- **aarch64** (not shipped) still compiles. `klug_frame` and `klug_sys_syslog` decline there, so it takes the fallbacks.
+- `cyrius audit`: fmt and lint are clean, and every undocumented fn is a test fn, so it still exits 1 on the docs stage.
+- **Reference coverage** is 23/31 (74%). The three fns new to the unreferenced list are `klug_sys_syslog`, which the VM
+  run executes, and `klug_pri_lens` / `klug_record_level`, which the tests reach through the lens.
+- **Not run:** `build/klug_agnos` on agnos. It was built, not booted.
+
 ## [0.3.1] - 2026-11-01 (cyrius 6.7.18; klug runs with no /proc, and its flags still work)
 
 Toolchain **6.7.9 → 6.7.18** with a vendored-`lib/` re-sync, then a fix for the one real bug the bump turned up. Tests
@@ -40,6 +109,8 @@ reproduce byte-for-byte from a pristine copy of the tracked tree.
     pin bump that changes it. At runtime a changed layout lands on step 3.
   - **One case still exits 1: `/dev/kmsg` itself cannot be opened**, as in a chroot with no `/dev`. The flags and
     `--help` work there, but klug has no log to read, and says so.
+  - ⚠ **Correction, made at 0.3.2:** "no heap" above is wrong. `alloc_init` exits on a failed `mmap`, so in that case
+    0.3.1 exits 1 with no log. See 0.3.2 for the fix.
 
 ### Changed
 

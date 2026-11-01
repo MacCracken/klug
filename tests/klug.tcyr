@@ -14,8 +14,10 @@
 #   · the /dev/kmsg drain, `klug_kmsg_drain`, driven through a scripted fake reader
 #     that refuses a record that does not fit exactly as devkmsg_read does — so a log
 #     bigger than the buffer, -EAGAIN / -EPIPE / -EINTR and a failed read all run here;
-#   · the command line when /proc cannot give it, `klug_args_open`'s fallback: fake initial
-#     stacks for the reader, and this process's real stack for the frame walk that finds it.
+#   · the command line, `klug_args_open`: fake initial stacks for the reader, and this
+#     process's real stack for the frame walk that finds it;
+#   · the syslog(2) source, `klug_syslog_dump`, driven through a scripted fake syslog(2)
+#     that hands out the newest whole lines that fit, as the kernel's does.
 
 include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
@@ -923,10 +925,10 @@ fn test_args_lost_table() {
     return 0;
 }
 
-fn test_args_recover_reads_the_flags_off_the_stack() {
+fn test_args_pick_reads_the_flags_off_the_stack() {
     klug_stack_args = 0;
     var sp = _st_args3("klug", "-e", "--warn");
-    assert_eq(klug_args_recover(sp), 1, "step 2: the flags survived");
+    assert_eq(klug_args_pick(sp), 0, "step 1: the stack checks out");
     assert_eq(klug_argc(), 3, "klug_argc reads the stack");
     assert(streq(klug_argv(0), "klug") == 1, "klug_argv(0) reads the stack");
     assert(streq(klug_argv(1), "-e") == 1, "klug_argv(1) reads the stack");
@@ -935,14 +937,16 @@ fn test_args_recover_reads_the_flags_off_the_stack() {
     return 0;
 }
 
-fn test_args_recover_never_refuses() {
+fn test_args_pick_falls_back_to_lib_args() {
     klug_stack_args = 0;
-    assert_eq(klug_args_recover(0), 0, "step 3: no stack, no flags, and it returns");
-    assert_eq(klug_stack_args, 0, "step 3: nothing to read");
+    assert_eq(klug_args_pick(0), 0, "step 2: no stack, and /proc is fine here");
+    assert_eq(klug_stack_args, 0, "step 2: lib/args.cyr's copy");
+    assert_eq(klug_argc(), argc(), "step 2: klug_argc is argc");
+    assert_eq(klug_argv(0), argv(0), "step 2: klug_argv is argv");
     var sp = _st_args3("klug", "-e", "-w");
     _st_word(0, 9);
-    assert_eq(klug_args_recover(sp), 0, "step 3: a bad stack is not trusted");
-    assert_eq(klug_stack_args, 0, "step 3: a bad stack is not read");
+    assert_eq(klug_args_pick(sp), 0, "step 2: a bad stack is passed over");
+    assert_eq(klug_stack_args, 0, "step 2: a bad stack is not read");
     return 0;
 }
 
@@ -993,6 +997,18 @@ fn test_frame_walk_is_bounded() {
     return 0;
 }
 
+fn test_frame_walk_will_not_chase_a_wild_rbp() {
+    var keep = KLUG_FRAME_SPAN;
+    store64(&_fr, &_fr + 16);
+    store64(&_fr + 16, 0);
+    KLUG_FRAME_SPAN = 16;
+    assert_eq(klug_frame_walk(&_fr), &_fr + 32, "exactly the span is a frame");
+    KLUG_FRAME_SPAN = 15;
+    assert_eq(klug_frame_walk(&_fr), 0, "past the span is not a frame");
+    KLUG_FRAME_SPAN = keep;
+    return 0;
+}
+
 # ⛔ NOT A FAKE: this is this process's own stack. klug_init_sp leans on the compiler's layout
 # (top-level never moves rsp, every fn keeps an rbp frame), so this is what catches a compiler
 # that changes it. The fallback itself would only land on step 3, losing the flags quietly.
@@ -1008,7 +1024,7 @@ fn test_init_stack_is_the_kernels() {
         assert(streq(load64(sp + 8 + i * 8), argv(i)) == 1, "the kernel's argv[i] is /proc's");
         i = i + 1;
     }
-    assert_eq(klug_args_recover(sp), 1, "the real stack passes the reader's checks");
+    assert_eq(klug_args_pick(sp), 0, "the real stack passes the reader's checks");
     assert_eq(klug_argc(), argc(), "both readers agree on argc");
     klug_stack_args = 0;
     return 0;
@@ -1018,40 +1034,276 @@ fn test_init_stack_is_the_kernels() {
 var _SYS_SETRLIMIT = 160;
 var _RLIMIT_NOFILE = 7;
 var _rl[2];                 # { soft, hard }
-var _open_rc = 0;
+var _fd_soft = 0;
 
-# Run klug_args_open with no fd to be had, so args_init REALLY fails (-EMFILE) in this process.
-fn _args_open_without_fds(): i64 {
+# Take every fd away from this process, so that an open REALLY fails (-EMFILE), and give them back.
+fn _fds_off(): i64 {
     assert_eq(sys_getrlimit(_RLIMIT_NOFILE, &_rl), 0, "harness: read the fd limit");
-    var soft = load64(&_rl);
+    _fd_soft = load64(&_rl);
     store64(&_rl, 0);
     assert_eq(syscall(_SYS_SETRLIMIT, _RLIMIT_NOFILE, &_rl), 0, "harness: take the fds away");
-    _open_rc = args_init();
-    var r = klug_args_open();
-    store64(&_rl, soft);
-    assert_eq(syscall(_SYS_SETRLIMIT, _RLIMIT_NOFILE, &_rl), 0, "harness: give the fds back");
-    return r;
+    return 0;
 }
 
-fn test_args_open_recovers_when_args_init_really_fails() {
+fn _fds_on(): i64 {
+    store64(&_rl, _fd_soft);
+    assert_eq(syscall(_SYS_SETRLIMIT, _RLIMIT_NOFILE, &_rl), 0, "harness: give the fds back");
+    return 0;
+}
+
+fn test_args_open_takes_the_stack_first() {
     klug_stack_args = 0;
-    assert(args_init() > 0, "harness: lib/args.cyr reads /proc/self/cmdline here");
-    var ac = argc();
-    assert_eq(_args_open_without_fds(), 0, "it never fails");
-    assert_eq(_open_rc, 0 - 24, "harness: args_init really failed, -EMFILE");
-    assert(klug_stack_args != 0, "the command line came off the initial stack");
-    assert_eq(klug_argc(), ac, "the stack's argc is /proc's");
+    assert_eq(klug_args_open(), 0, "klug has its command line");
+    assert(klug_stack_args != 0, "the stack comes first: it takes no heap, no fd and no /proc");
+    assert_eq(klug_argc(), argc(), "the stack's argc is /proc's");
     assert(streq(klug_argv(0), argv(0)) == 1, "the stack's argv[0] is /proc's");
     klug_stack_args = 0;
     return 0;
 }
 
-fn test_args_open_leaves_a_healthy_run_alone() {
+fn test_args_open_needs_no_fd() {
     klug_stack_args = 0;
-    assert_eq(klug_args_open(), 0, "it never fails");
-    assert_eq(klug_stack_args, 0, "a healthy run stays on lib/args.cyr");
-    assert_eq(klug_argc(), argc(), "klug_argc is argc");
-    assert_eq(klug_argv(0), argv(0), "klug_argv is argv");
+    assert(args_init() > 0, "harness: lib/args.cyr reads /proc/self/cmdline here");
+    var ac = argc();
+    _fds_off();
+    var rc = args_init();
+    var r = klug_args_open();
+    _fds_on();
+    assert_eq(rc, 0 - 24, "harness: args_init really fails, -EMFILE");
+    assert_eq(r, 0, "klug still has its command line");
+    assert(klug_stack_args != 0, "the command line came off the initial stack");
+    assert_eq(klug_argc(), ac, "and it is the whole of it");
+    klug_stack_args = 0;
+    return 0;
+}
+
+fn test_args_pick_never_refuses() {
+    klug_stack_args = 0;
+    _fds_off();
+    var rc = args_init();
+    var r = klug_args_pick(0);
+    _fds_on();
+    assert_eq(rc, 0 - 24, "harness: args_init really fails, -EMFILE");
+    assert_eq(r, 1, "step 3: no stack, no /proc, and it returns to dump the whole log");
+    assert_eq(klug_stack_args, 0, "step 3: nothing to read");
+    return 0;
+}
+
+# A scripted syslog(2). READ_ALL behaves as the kernel's does: the newest whole lines that fit.
+var _sl_log = 0;
+var _sl_len = 0;
+var _sl_size = 0;           # what SIZE_BUFFER answers
+var _sl_err = 0;            # nonzero: what READ_ALL answers instead
+var _sl_reads = 0;
+var _sl_into = 0;           # where the last READ_ALL was pointed
+var _sl_offer = 0;          # and how much it was offered
+var _sl_buf[32];            # 256 B: klug_buf's stand-in
+
+fn _sl_reset(log, size): i64 {
+    _sl_log = log; _sl_len = strlen(log); _sl_size = size; _sl_err = 0;
+    _sl_reads = 0; _sl_into = 0; _sl_offer = 0;
+    _wr_reset(0);
+    _wr_strict = 0;
+    return 0;
+}
+
+fn _fake_syslog(cmd, p, len): i64 {
+    if (cmd == KLUG_SYSLOG_SIZE_BUFFER) { return _sl_size; }
+    _sl_reads = _sl_reads + 1;
+    _sl_into = p;
+    _sl_offer = len;
+    if (cmd != KLUG_SYSLOG_READ_ALL) { return 0 - 22; }
+    if (_sl_err != 0) { return _sl_err; }
+    var skip = 0;
+    while (_sl_len - skip > len) {
+        while (load8(_sl_log + skip) != 10) { skip = skip + 1; }
+        skip = skip + 1;
+    }
+    memcpy(p, _sl_log + skip, _sl_len - skip);
+    return _sl_len - skip;
+}
+
+fn _sl_dump(min_level): i64 {
+    return klug_syslog_dump(&_fake_syslog, min_level, &_sl_buf, 256, &_fake_writer, KLUG_WR_LINUX);
+}
+
+# Three 89 B lines, oldest first: 267 B against _sl_buf's 256. Built here and not with _cat,
+# which zeroes its buffer first and so cannot take its own result as an operand.
+var _sl_big[64];
+
+fn _sl_big_log(): i64 {
+    var a = "<6>[    1.000000] 0123456789012345678901234567890123456789012345678901234567890123456789\n";
+    var b = "<4>[    2.000000] 0123456789012345678901234567890123456789012345678901234567890123456789\n";
+    var c = "<3>[    3.000000] 0123456789012345678901234567890123456789012345678901234567890123456789\n";
+    memset(&_sl_big, 0, 512);
+    memcpy(&_sl_big, a, 89);
+    memcpy(&_sl_big + 89, b, 89);
+    memcpy(&_sl_big + 178, c, 89);
+    return &_sl_big;
+}
+
+fn _slevel(s): i64 {
+    return klug_level_of(s, strlen(s), KLUG_SRC_SYSLOG);
+}
+
+fn _stagged(s): i64 {
+    return klug_has_level_tag(s, strlen(s), KLUG_SRC_SYSLOG);
+}
+
+fn _spri(s): i64 {
+    return klug_syslog_pri_level(s, strlen(s));
+}
+
+fn test_syslog_priority_maps_to_level() {
+    assert_eq(_slevel("<0>[    1.000000] emerg\n"), KLUG_LVL_ERR, "<0> emerg -> ERR");
+    assert_eq(_slevel("<3>[    1.000000] err\n"), KLUG_LVL_ERR, "<3> err -> ERR");
+    assert_eq(_slevel("<4>[    1.000000] warning\n"), KLUG_LVL_WARN, "<4> warning -> WARN");
+    assert_eq(_slevel("<5>[    1.000000] notice\n"), KLUG_LVL_ALL, "<5> notice -> ALL");
+    assert_eq(_slevel("<6>[    1.000000] info\n"), KLUG_LVL_ALL, "<6> info -> ALL");
+    assert_eq(_slevel("<7>[    1.000000] debug\n"), KLUG_LVL_ALL, "<7> debug -> ALL");
+    assert_eq(_slevel("<3>no uptime field (printk.time=0)\n"), KLUG_LVL_ERR, "the uptime is optional");
+    assert_eq(_slevel("<3>"), KLUG_LVL_ERR, "the shortest record");
+    return 0;
+}
+
+fn test_syslog_facility_bits_are_ignored() {
+    assert_eq(_slevel("<11>[    1.000000] user.err\n"), KLUG_LVL_ERR, "<11> user.err -> ERR");
+    assert_eq(_slevel("<12>[    1.000000] user.warning\n"), KLUG_LVL_WARN, "<12> user.warning -> WARN");
+    assert_eq(_slevel("<14>[    1.000000] user.info\n"), KLUG_LVL_ALL, "<14> user.info -> ALL");
+    assert_eq(_slevel("<27>[    1.000000] daemon.err\n"), KLUG_LVL_ERR, "<27> daemon.err -> ERR");
+    assert_eq(_slevel("<30>[    1.000000] daemon.info\n"), KLUG_LVL_ALL, "<30> daemon.info -> ALL");
+    return 0;
+}
+
+fn test_syslog_not_a_record_is_untagged() {
+    assert_eq(_spri("plain line\n"), 0 - 1, "no '<'");
+    assert_eq(_spri("<>x\n"), 0 - 1, "no digits");
+    assert_eq(_spri("x3>y\n"), 0 - 1, "a priority's shape with no '<' to open it");
+    assert_eq(_spri("<abc>x\n"), 0 - 1, "not digits");
+    assert_eq(_spri("< 3>x\n"), 0 - 1, "a byte below '0' is not a digit");
+    assert_eq(_spri("<3x>y\n"), 0 - 1, "digits, then not");
+    assert_eq(_spri("<3"), 0 - 1, "never closed");
+    assert_eq(_spri("<33"), 0 - 1, "never closed, and long enough to look");
+    assert_eq(_spri("<"), 0 - 1, "too short");
+    assert_eq(_spri(""), 0 - 1, "empty");
+    assert_eq(_spri(" <3>x\n"), 0 - 1, "the '<' opens the line or it is no priority");
+    assert_eq(_spri("3,1,2,-;x\n"), 0 - 1, "a /dev/kmsg record is not a syslog line");
+    assert_eq(_spri("<1234567890>x\n"), KLUG_LVL_ERR, "ten digits is a priority (..890 & 7 = 2)");
+    assert_eq(_spri("<12345678901>x\n"), 0 - 1, "an eleventh is not");
+    assert_eq(_slevel("plain line\n"), KLUG_LVL_ALL, "not a record -> ALL");
+    assert_eq(_stagged("plain line\n"), 0, "not a record -> untagged");
+    assert_eq(_stagged("<6>[    1.000000] info\n"), 1, "an info line is tagged, at level 0");
+    return 0;
+}
+
+fn test_syslog_lens_is_its_own_source() {
+    var line = "<3>[    1.000000] x\n";
+    assert_eq(klug_level_of(line, strlen(line), KLUG_SRC_RING), KLUG_LVL_ALL, "not a ring line");
+    assert_eq(klug_level_of(line, strlen(line), KLUG_SRC_KMSG), KLUG_LVL_ALL, "not a /dev/kmsg record");
+    var rec = "3,1,2,-;x\n";
+    assert_eq(klug_level_of(rec, strlen(rec), KLUG_SRC_SYSLOG), KLUG_LVL_ALL, "a record is not a line");
+    var more = " SUBSYSTEM=block\n";
+    assert_eq(klug_line_level(more, strlen(more), KLUG_SRC_SYSLOG, KLUG_LVL_ERR), KLUG_LVL_ALL,
+      "syslog(2) text has no continuations to inherit");
+    return 0;
+}
+
+fn test_emit_syslog_is_the_priority_lens() {
+    var log = _cat("<6>[    1.000000] boot ok\n<3>[    2.000000] disk error\n",
+      "<4>[    3.000000] low memory\n<6>[    4.000000] fine\n");
+    assert_eq(_emit(KLUG_LVL_ERR, log, KLUG_SRC_SYSLOG), 0, "-e -> 0");
+    assert_eq(_sink_is("<3>[    2.000000] disk error\n"), 1, "-e: the err line, nothing else");
+    log = _cat("<6>[    1.000000] boot ok\n<3>[    2.000000] disk error\n",
+      "<4>[    3.000000] low memory\n<6>[    4.000000] fine\n");
+    assert_eq(_emit(KLUG_LVL_WARN, log, KLUG_SRC_SYSLOG), 0, "-w -> 0");
+    assert_eq(_sink_is("<3>[    2.000000] disk error\n<4>[    3.000000] low memory\n"), 1,
+      "-w: the err and the warning, coalesced");
+    assert_eq(_wr_calls, 1, "-w: one contiguous run -> one write");
+    return 0;
+}
+
+fn test_syslog_dump_a_log_that_fits() {
+    var log = "<6>[    1.000000] boot ok\n<3>[    2.000000] disk error\n";
+    _sl_reset(log, 64);
+    assert_eq(_sl_dump(KLUG_LVL_ALL), 0, "a dump -> 0");
+    assert_eq(_sink_is(log), 1, "the whole log, as the kernel rendered it");
+    assert_eq(_sl_into, &_sl_buf, "a ring that fits stays in the static buffer");
+    assert_eq(_sl_reads, 1, "one read");
+    return 0;
+}
+
+fn test_syslog_dump_filters() {
+    var log = "<6>[    1.000000] boot ok\n<3>[    2.000000] disk error\n";
+    _sl_reset(log, 64);
+    assert_eq(_sl_dump(KLUG_LVL_ERR), 0, "-e -> 0");
+    assert_eq(_sink_is("<3>[    2.000000] disk error\n"), 1, "-e reads the syslog lens");
+    return 0;
+}
+
+fn test_syslog_dump_reads_a_log_bigger_than_the_buffer() {
+    var log = _sl_big_log();
+    assert_eq(strlen(log), 267, "harness: the log is bigger than the 256 B buffer");
+    _sl_reset(log, 512);
+    assert_eq(_sl_dump(KLUG_LVL_ALL), 0, "a dump -> 0");
+    assert_eq(_sink_is(log), 1, "the whole log, oldest line included");
+    assert(_sl_into != &_sl_buf, "read into a mapping");
+    assert_eq(_sl_offer, 1024, "twice the ring, for the prefixes it gains");
+    return 0;
+}
+
+fn test_syslog_dump_survives_a_refused_mapping() {
+    var log = _sl_big_log();
+    assert_eq(strlen(log), 267, "harness: the log is bigger than the 256 B buffer");
+    _sl_reset(log, 1 << 46);            # twice this cannot be mapped
+    assert_eq(_sl_dump(KLUG_LVL_ALL), 0, "no mapping is not a failure");
+    assert_eq(_sl_into, &_sl_buf, "it falls back on the static buffer");
+    assert_eq(_sl_offer, 256, "and offers what that holds");
+    assert_eq(_wr_sunk, 178, "what fit: two of the three lines");
+    assert_eq(memeq(&_wr_sink, log + 89, 178), 1, "the newest lines are what fit, not the oldest");
+    return 0;
+}
+
+fn test_syslog_dump_survives_a_failed_size_call() {
+    var log = "<3>[    2.000000] disk error\n";
+    _sl_reset(log, 0 - 1);
+    assert_eq(_sl_dump(KLUG_LVL_ALL), 0, "SIZE_BUFFER failing costs nothing");
+    assert_eq(_sink_is(log), 1, "the log still comes out");
+    assert_eq(_sl_into, &_sl_buf, "through the static buffer");
+    return 0;
+}
+
+fn test_syslog_dump_reports_a_refusal_with_nothing_written() {
+    _sl_reset("<3>[    2.000000] disk error\n", 64);
+    _sl_err = 0 - 1;
+    assert_eq(_sl_dump(KLUG_LVL_ALL), 0 - 1, "-EPERM -> -1, for klug_dump to report");
+    assert_eq(_wr_calls, 0, "nothing written");
+    return 0;
+}
+
+fn test_syslog_dump_an_empty_log_and_a_failed_write() {
+    _sl_reset("", 64);
+    assert_eq(_sl_dump(KLUG_LVL_ALL), 0, "an empty log -> 0");
+    assert_eq(_wr_calls, 0, "nothing to write");
+    _sl_reset("<3>[    2.000000] disk error\n", 64);
+    _wr_always(0 - 32);
+    assert_eq(_sl_dump(KLUG_LVL_ALL), 1, "a failed write -> 1, as any dump");
+    return 0;
+}
+
+fn test_syslog_cut_sees_a_read_that_ran_out_of_room() {
+    assert_eq(klug_syslog_cut(65536, 65536), 1, "a full buffer may have left records behind");
+    assert_eq(klug_syslog_cut(65536, 65536 - KLUG_KMSG_REC_MAX + 1), 1, "within one record of full");
+    assert_eq(klug_syslog_cut(65536, 65536 - KLUG_KMSG_REC_MAX), 0, "room for one more record");
+    assert_eq(klug_syslog_cut(262144, 1000), 0, "a mapping with room to spare");
+    return 0;
+}
+
+fn test_klug_map_is_memory() {
+    var p = klug_map(4096);
+    assert(p != 0, "a mapping");
+    store64(p + 4088, 7);
+    assert_eq(load64(p + 4088), 7, "it can be written");
+    assert_eq(klug_map(1 << 47), 0, "a refused mapping is 0, never an exit");
     return 0;
 }
 
@@ -1120,15 +1372,32 @@ fn main(): i64 {
     test_stack_args_refuse_what_is_not_a_stack();
     test_stack_args_walk_is_bounded();
     test_args_lost_table();
-    test_args_recover_reads_the_flags_off_the_stack();
-    test_args_recover_never_refuses();
+    test_args_pick_reads_the_flags_off_the_stack();
+    test_args_pick_falls_back_to_lib_args();
     test_frame_walk_ends_at_the_outermost_frame();
     test_frame_walk_refuses_a_broken_chain();
     test_frame_walk_is_bounded();
+    test_frame_walk_will_not_chase_a_wild_rbp();
     test_frame_is_the_callers_and_still_live();
     test_init_stack_is_the_kernels();
-    test_args_open_recovers_when_args_init_really_fails();
-    test_args_open_leaves_a_healthy_run_alone();
+    test_args_open_takes_the_stack_first();
+    test_args_open_needs_no_fd();
+    test_args_pick_never_refuses();
+    test_group("klug syslog(2) — when /dev/kmsg cannot be opened");
+    test_syslog_priority_maps_to_level();
+    test_syslog_facility_bits_are_ignored();
+    test_syslog_not_a_record_is_untagged();
+    test_syslog_lens_is_its_own_source();
+    test_emit_syslog_is_the_priority_lens();
+    test_syslog_dump_a_log_that_fits();
+    test_syslog_dump_filters();
+    test_syslog_dump_reads_a_log_bigger_than_the_buffer();
+    test_syslog_dump_survives_a_refused_mapping();
+    test_syslog_dump_survives_a_failed_size_call();
+    test_syslog_dump_reports_a_refusal_with_nothing_written();
+    test_syslog_dump_an_empty_log_and_a_failed_write();
+    test_syslog_cut_sees_a_read_that_ran_out_of_room();
+    test_klug_map_is_memory();
     return assert_summary();
 }
 

@@ -36,6 +36,7 @@ var KLUG_LVL_ERR  = 2;   # errors only
 # ("a leading digit is just a byte") provable on the host.
 var KLUG_SRC_RING = 0;   # agnos klug#36 ring: "[I] "/"[W] "/"[E] " tags behind an optional uptime prefix
 var KLUG_SRC_KMSG = 1;   # Linux /dev/kmsg wire records: "<pri>,<seq>,<ts>,<flags>;<msg>" + " KEY=VAL" continuations
+var KLUG_SRC_SYSLOG = 2; # Linux syslog(2) text, the /dev/kmsg fallback: "<pri>[    4.123456] msg" on every line
 
 # The kernel's klug_info/klug_warn/klug_err prefix lines with "[I] " / "[W] " /
 # "[E] " (see core/klug.cyr). Return the severity of a line beginning at `p`
@@ -104,10 +105,46 @@ fn klug_kmsg_pri_level(p, len): i64 {
     if (n == 0) { return 0 - 1; }                      # no digits at all
     if (n >= len) { return 0 - 1; }                    # digits to the end: no comma
     if (load8(p + n) != 44) { return 0 - 1; }          # ',' = 44
+    return klug_pri_lens(pri);
+}
+
+# A syslog priority on the three-step lens (see klug_kmsg_pri_level for the slicing).
+fn klug_pri_lens(pri): i64 {
     var level = pri & 7;
     if (level <= 3) { return KLUG_LVL_ERR; }
     if (level == 4) { return KLUG_LVL_WARN; }
     return KLUG_LVL_ALL;
+}
+
+# The syslog(2) lens primitive. A line is "<pri>[    4.123456] msg\n" (the uptime only under
+# printk.time), and <pri> is the same facility<<3 | level a /dev/kmsg record carries. A record of
+# several lines repeats the prefix on each, so unlike /dev/kmsg this text has no continuations.
+# Returns -1 when the bytes at `p` do not open with "<digits>"; the run is capped at 10 digits,
+# as klug_kmsg_pri_level's is.
+fn klug_syslog_pri_level(p, len): i64 {
+    if (len < 3) { return 0 - 1; }                     # "<N>" at the shortest
+    if (load8(p) != 60) { return 0 - 1; }              # '<' = 60
+    var i = 1;
+    var pri = 0;
+    while (i < len) {
+        var c = load8(p + i);
+        if (c == 62) {                                 # '>' = 62
+            if (i == 1) { return 0 - 1; }              # "<>": no digits at all
+            return klug_pri_lens(pri);
+        }
+        if (c < 48) { return 0 - 1; }                  # below '0' (48)
+        if (c > 57) { return 0 - 1; }                  # above '9' (57)
+        if (i > 10) { return 0 - 1; }                  # an 11th digit: not a priority
+        pri = pri * 10 + (c - 48);
+        i = i + 1;
+    }
+    return 0 - 1;                                      # "<123" to the end: never closed
+}
+
+# The record-header level of a line from one of the two Linux sources, or -1 for not-a-record.
+fn klug_record_level(p, len, src): i64 {
+    if (src == KLUG_SRC_KMSG) { return klug_kmsg_pri_level(p, len); }
+    return klug_syslog_pri_level(p, len);
 }
 
 # Severity of the line at `p` (length `len`) as read from `src`: KLUG_LVL_ERR / _WARN / _ALL.
@@ -118,10 +155,11 @@ fn klug_kmsg_pri_level(p, len): i64 {
 #   KLUG_SRC_KMSG — the /dev/kmsg lens: the record's syslog priority decides (klug_kmsg_pri_level).
 #                   A line that is not a record header — a " KEY=VAL" continuation, or garbage —
 #                   is ALL here; klug_line_level is what hands a continuation its record's level.
+#   KLUG_SRC_SYSLOG — the syslog(2) lens: the same priority, off the "<pri>" that opens every line.
 # Stateless and per-line on purpose: klug_dump feeds it one line at a time.
 fn klug_level_of(p, len, src): i64 {
-    if (src == KLUG_SRC_KMSG) {
-        var k = klug_kmsg_pri_level(p, len);
+    if (src != KLUG_SRC_RING) {
+        var k = klug_record_level(p, len, src);
         if (k >= 0) { return k; }
         return KLUG_LVL_ALL;
     }
@@ -158,10 +196,10 @@ fn klug_level_of(p, len, src): i64 {
 # that from a silent false negative into a message on stderr.
 # On the /dev/kmsg source a record header IS the tag — a "6," info record counts exactly as
 # a "[I] " line does on the ring: level 0, but present, so a filter that drops everything is
-# reported as "no warnings" and not as "no lens".
+# reported as "no warnings" and not as "no lens". A syslog(2) "<pri>" counts the same way.
 fn klug_has_level_tag(p, len, src): i64 {
-    if (src == KLUG_SRC_KMSG) {
-        if (klug_kmsg_pri_level(p, len) >= 0) { return 1; }
+    if (src != KLUG_SRC_RING) {
+        if (klug_record_level(p, len, src) >= 0) { return 1; }
         return 0;
     }
     var toff = klug_time_prefix_len(p, len);           # step over "[    4.123456] " if present
@@ -237,6 +275,7 @@ fn klug_usage(): i64 {
     println("on Linux the log is /dev/kmsg (needs root, or kernel.dmesg_restrict=0), dumped");
     println("  as its raw records; the lens reads each record's syslog level:");
     println("  -w = warning and worse (level <= 4), -e = err and worse (level <= 3).");
+    println("  if /dev/kmsg cannot be opened, the log comes from syslog(2) as <pri>[time] msg.");
     #endif
     return 0;
 }
@@ -329,24 +368,32 @@ fn klug_err_line(s: cstring): i64 {
 }
 
 # ⛔ klug ALWAYS RUNS. It is what you reach for when the box is already sick, so nothing about
-# its own command line may stop it, and nothing may silently change what it prints. On Linux
-# lib/args.cyr reads argv only from /proc/self/cmdline, so with no /proc (a chroot, a minimal
-# container), no free fd or no heap, argc() is 0. Through 0.3.0 every flag then vanished without
-# a word: `klug -e` dumped the whole log, `klug --help` dumped it too, and both exited 0.
-#
-# argv does not live in /proc. The kernel builds it on the initial stack, [sp]=argc,
-# [sp+8+i*8]=argv[i], then a NULL, which is where agnos and macOS read it. So, in order:
-#   1. lib/args.cyr: the normal path, and the only one agnos needs (its entry parks the stack).
-#   2. the initial stack: the flags still work, and nothing needs saying.
+# its own command line may stop it, and nothing may silently change what it prints. argv needs
+# nothing to read: the kernel builds it on the initial stack, [sp]=argc, [sp+8+i*8]=argv[i], then
+# a NULL, which is where agnos and macOS read it. lib/args.cyr on Linux reads
+# /proc/self/cmdline instead, and that takes a mounted /proc, a free fd and a 2 MB heap. So on
+# Linux, in order:
+#   1. the initial stack: it takes nothing, so it cannot fail on a sick box.
+#   2. lib/args.cyr: only when the stack did not check out, which a compiler change would do.
 #   3. neither: dump the WHOLE log and say so on stderr. It is a superset of what any filter
 #      would print, so the line an operator came for is in it. NEVER refuse to run.
+# agnos has only lib/args.cyr: its entry parks the stack, so that IS step 1.
 #
-# ⚠ Step 2 is reached only after step 1 failed, so a healthy run never walks the stack.
+# ⛔ THE STACK COMES FIRST BECAUSE OF THE HEAP. lib/alloc.cyr's alloc_init EXITS when its first
+# mmap fails; it does not return 0. So on a box short of address space args_init killed klug
+# before it read a byte (0.3.1 tried it first, and exited 1 with no log). Through 0.3.0, a failed
+# args_init instead lost every flag without a word: `klug -e` dumped the whole log, `klug --help`
+# dumped it too, and both exited 0.
+#
+# ⚠ So nothing on klug's path may call alloc() while it can still get by without one. Step 2
+# still can exit that way, but only after the stack failed too.
 
-# The longest argv and the deepest call chain the stack readers walk. klug takes a handful of
-# flags; past these bounds it is step 3, not a crash.
+# The longest argv and the deepest call chain the stack readers walk, and the widest gap one
+# saved rbp may leave to the next (this runs on every launch, so a wild rbp must not be chased).
+# klug takes a handful of flags; past these bounds it is the next step, not a crash.
 var KLUG_ARGV_MAX = 4096;
 var KLUG_FRAME_MAX = 64;
+var KLUG_FRAME_SPAN = 1048576;
 
 # The initial stack klug_argc / klug_argv read, or 0 for lib/args.cyr's copy of the command line.
 var klug_stack_args = 0;
@@ -389,19 +436,20 @@ fn klug_args_lost(rc, ac): i64 {
     return 0;
 }
 
-# Steps 2 and 3. Reads the flags from the initial stack at `sp` and returns 1; or, when `sp` is
-# not one, says on stderr that the flags are gone and returns 0, and the dump goes ahead whole.
-fn klug_args_recover(sp): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+# The three steps, with `sp` the initial stack as klug_init_sp found it. Returns 0 when klug has
+# its command line, or 1 when it does not: stderr says so, and the dump goes ahead whole.
+fn klug_args_pick(sp): i64 {
     if (klug_stack_argc(sp) >= 0) {
         klug_stack_args = sp;
-        return 1;
+        return 0;
     }
+    if (klug_args_lost(args_init(), argc()) == 0) { return 0; }
     klug_err_line("klug: cannot read the command line, so any flags are NOT applied:");
     klug_err_line("      dumping the whole log instead.");
-    return 0;
+    return 1;
 }
 
-#ifndef CYRIUS_TARGET_AGNOS
 # The caller's frame pointer: the saved rbp, so a frame that is still live when this returns.
 # The same shape as lib/args_agnos.cyr's r15 read. 0 on aarch64, which lands on step 3.
 fn klug_frame(): i64 {
@@ -423,6 +471,7 @@ fn klug_frame_walk(f): i64 {
         var up = load64(f);
         if (up == 0) { return f + 16; }
         if (up <= f) { return 0; }                      # a frame chain climbs the stack
+        if (up - f > KLUG_FRAME_SPAN) { return 0; }     # one small frame at a time
         if (hops >= KLUG_FRAME_MAX) { return 0; }
         hops = hops + 1;
         f = up;
@@ -435,21 +484,91 @@ fn klug_frame_walk(f): i64 {
 # moves it, and the kernel starts a process with rbp = 0, so the frame chain ends at the first
 # fn top-level called. Its saved rbp is that 0, its return address is at rbp+8, and the kernel's
 # rsp is at rbp+16. test_init_stack_is_the_kernels pins this against the real argv, so a compiler
-# that changes the layout goes red at its pin bump; here it only lands on step 3.
+# that changes the layout goes red at its pin bump; here it only lands on step 2.
 fn klug_init_sp(): i64 {
     var sp = klug_frame_walk(klug_frame());
     return sp;                                          # not a tail call: that pops klug_frame's frame
 }
 #endif
 
-# Set up the command line for klug_argc / klug_argv. Whatever happens here, klug runs.
+# Set up the command line for klug_argc / klug_argv. Whatever happens here, klug runs. Returns
+# 0, or 1 when the flags were lost.
 fn klug_args_open(): i64 {
-    var rc = args_init();
-    #ifndef CYRIUS_TARGET_AGNOS
-    if (klug_args_lost(rc, argc()) == 1) { klug_args_recover(klug_init_sp()); }
+    #ifdef CYRIUS_TARGET_AGNOS
+    return args_init();
     #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return klug_args_pick(klug_init_sp());
+    #endif
+}
+
+#ifndef CYRIUS_TARGET_AGNOS
+# syslog(2)'s commands (linux/syslog.h), and x86_64's number for it: lib/syscalls names neither.
+var KLUG_SYSLOG_READ_ALL = 3;
+var KLUG_SYSLOG_SIZE_BUFFER = 10;
+var KLUG_SYS_SYSLOG = 103;
+
+# The production syslog(2): one raw call. Shaped `(cmd, p, len) -> count-or-negative-errno` so a
+# test can stand a scripted fake in its place. It declines on aarch64, which has another number.
+fn klug_sys_syslog(cmd, p, len): i64 {
+    #ifndef CYRIUS_ARCH_AARCH64
+    return syscall(KLUG_SYS_SYSLOG, cmd, p, len);
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    return 0 - 38;
+    #endif
+}
+
+# `len` bytes of fresh zeroed memory, or 0. A raw mmap and NOT alloc(): alloc_init exits when
+# it fails, and this is the path that must survive a box with no memory to give.
+fn klug_map(len): i64 {
+    var p = syscall(SYS_MMAP, 0, len, 3, 0x22, 0 - 1, 0);   # PROT_READ|WRITE, PRIVATE|ANONYMOUS
+    if (p < 0) { return 0; }
+    return p;
+}
+
+# Dump the log through `sys` (a `&fn(cmd, p, len)`; klug_dump hands it klug_sys_syslog) when
+# /dev/kmsg cannot be opened, writing lines at or above `min_level` through `writer`. Returns
+# klug_emit's exit code, or -1 when syslog(2) gave no log either, with nothing written.
+#
+# ⛔ WHY IT EXISTS. /dev/kmsg is a path, so it needs a mounted /dev and a free fd, and a chroot or
+# a minimal container often has neither. syslog(2) is a syscall and needs neither, nor /proc: it
+# takes only the privilege /dev/kmsg itself takes, so if klug was allowed to read the log at all,
+# this works. Through 0.3.1 a missing /dev/kmsg was exit 1 with no log.
+#
+# READ_ALL renders the newest records that fit, so `buf` alone would quietly lose the OLDEST of
+# any log over `cap`. The text can outgrow the ring it came from, because every record gains a
+# "<pri>[time] " prefix: at one record per 32 B of ring (printk's own sizing) twice the ring
+# holds it. So it reads into a mapping of that size, and when that is refused it reads what `buf`
+# holds, which is the newest of the log, and says so. The size call failing costs only that.
+#
+# The text goes out as the kernel renders it, as a /dev/kmsg dump does, in its own format, so
+# stderr says which one this is.
+fn klug_syslog_dump(sys, min_level, buf, cap, writer, mode): i64 {
+    var p = buf;
+    var c = cap;
+    var want = fncall3(sys, KLUG_SYSLOG_SIZE_BUFFER, 0, 0) * 2;
+    if (want > cap) {
+        var big = klug_map(want);
+        if (big != 0) { p = big; c = want; }
+    }
+    var n = fncall3(sys, KLUG_SYSLOG_READ_ALL, p, c);
+    if (n < 0) { return 0 - 1; }
+    klug_err_line("klug: /dev/kmsg cannot be opened, so this is syslog(2)'s view of the log:");
+    klug_err_line("      <pri>[time] msg on each line, not /dev/kmsg's records.");
+    if (klug_syslog_cut(c, n) == 1) {
+        klug_err_line("klug: the log may not all have fit: this is its NEWEST part.");
+    }
+    return klug_emit(min_level, p, n, KLUG_SRC_SYSLOG, writer, mode);
+}
+
+# Could READ_ALL have stopped short? It fills `c` with whole records, newest first, so a read
+# that ended within one worst-case record of `c` may have had an older record left over.
+fn klug_syslog_cut(c, n): i64 {
+    if (c - n < KLUG_KMSG_REC_MAX) { return 1; }
     return 0;
 }
+#endif
 
 # Read the kernel log into `buf` (KLUG_RING_BYTES bytes) and write the lines at or
 # above `min_level` to stdout. Returns 0 on success, 1 on a read failure or an
@@ -472,10 +591,13 @@ fn klug_dump(min_level, buf): i64 {
     # default on systemd distros) makes open() return EPERM for non-root anyway, so
     # an unprivileged run normally lands in the branch below — that is the host
     # policy, not a klug failure. O_NONBLOCK so a read returns -EAGAIN once the log
-    # is drained instead of blocking for future messages.
+    # is drained instead of blocking for future messages. A failed open is not the end
+    # of the log: klug_syslog_dump needs no /dev and no fd.
     var fd = sys_open("/dev/kmsg", O_RDONLY | O_NONBLOCK, 0);
     if (fd < 0) {
-        klug_err_line("klug: kernel log unavailable on this host (open /dev/kmsg failed);");
+        var sr = klug_syslog_dump(&klug_sys_syslog, min_level, buf, KLUG_RING_BYTES, &klug_stdout_write, KLUG_WR_LINUX);
+        if (sr >= 0) { return sr; }
+        klug_err_line("klug: kernel log unavailable on this host (/dev/kmsg and syslog(2) both failed);");
         klug_err_line("      needs root, or kernel.dmesg_restrict=0.");
         klug_err_line("      the native reader is agnos klug#36 — build with `cyrius build --agnos`.");
         return 1;
