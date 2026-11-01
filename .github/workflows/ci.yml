@@ -50,9 +50,10 @@ jobs:
 
       - name: Test
         # Explicit .tcyr path (matches patra + the other AGNOS-tic tools).
-        # `cyrius tests` would also work at this pin — it discovers .tcyr under
-        # tests/ recursively since 6.4.72 — but naming the file keeps the gate
-        # pinned to the one suite this repo has.
+        # `cyrius test tests` would also work — the directory form walks .tcyr
+        # recursively, and it replaces the `cyrius tests` verb (deprecated at
+        # 6.7.6, removed at 6.7.12) — but naming the file keeps the gate pinned
+        # to the one suite this repo has.
         run: cyrius test tests/klug.tcyr
 
       - name: Smoke (execute the host binary)

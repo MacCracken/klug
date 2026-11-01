@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-01 (cyrius 6.7.9)
+
+Toolchain **6.6.20 → 6.7.9** with a vendored-`lib/` re-sync. klug's own source did not change, and neither did its
+behaviour: tests stay at **212**, and the dump's output is byte-identical to the 6.6.20 build's (see *Verified*). Both
+shipped binaries are new, but neither file size moved (`build/klug` 161,328 B · `build/klug_agnos` 177,960 B): `.text`
+grew 224 / 320 B into the page-alignment gap before the data segment, so an unchanged size here says nothing about
+whether a binary was rebuilt. Both binaries reproduce byte-for-byte from a pristine copy of the tracked tree.
+
+### Changed
+
+- **Toolchain `6.6.20` → `6.7.9`.**
+  - **Vendored `lib/` re-synced.** `cyrius lib sync` copied **24/24** declared-closure files. All 25 tracked files,
+    `poison.cyr` included, byte-match the 6.7.9 snapshot. 14 changed:
+    - `alloc`, `alloc_agnos`, `atomic`, `fmt`, `io`, `syscalls` and `vec`: comments only.
+    - `fnptr`: `fncall8`'s x86_64 stack order (6.7.6) and new `CYRIUS_TARGET_CX` arms. klug calls only `fncall2` /
+      `fncall3`, whose Linux and agnos arms did not change.
+    - `syscalls_x86_64_agnos`: no `SYS_*` number moved, and `SYS_KLUG` is still 36. New `sys_ppoll` / `sys_ioctl` /
+      `sys_fstatat` peers that decline with -38, `SPAWN_ENV_MAX`, and `SPAWN_ARGV_MAX` split into a sizing const and a
+      read-only var. klug calls none of them.
+    - `syscalls_linux_common`, `syscalls_x86_64_linux`, `syscalls_aarch64_linux`, `syscalls_macos`, `syscalls_windows`:
+      new `sys_ppoll` plus comments; on Windows `sys_brk` now declines with -38. klug calls none of them.
+  - **No API klug calls moved.** `klug` is now ahead of agnos's own 6.6.20 pin, which is harmless: the syscall number
+    it reads through did not move.
+  - **The 6.7.0–6.7.9 upgrade notes checked** (`ecosystem-migration.md`). The silent ones first, since a build cannot
+    catch them:
+    - 6.7.3, a lone `!` is a real operator (the lexer used to DROP it): klug has none, only `!=`.
+    - 6.7.9, unary `-` / `~` on a constant binds tighter than a literal operator after it: klug has no such expression,
+      and spells negatives `0 - N`.
+    - 6.7.8, `*p` through a narrow `*T` reads the element: klug declares no narrow typed pointers.
+    - 6.7.6, `fncall8`'s argument order: see above.
+    - 6.7.0 / 6.7.3 / 6.7.5, the `impl`, `bool` and struct `OP=` rules: klug has no impls, bools or structs.
+    - 6.7.9, a `for` step must assign a declared variable, and a stray `}` is an error: klug has no `for`, and the build
+      is warning-free.
+    - 6.7.2–6.7.8, reserved `const`, `true`, `false`, `do`, `dyn`: klug names nothing with them.
+    - 6.7.9, a bare `cyrius bench` / `fuzz` / `smoke` with nothing to run exits 1: CI runs none of them, and
+      `cyrius audit` only prints a `skip:` line for bench.
+  - **`cyrius audit` still exits 1, as it did at 6.6.20.** fmt, lint and tests are clean. The exit comes from the docs
+    stage: any undocumented public fn sets it, and klug has 44 (same count at both pins). CI does not run `audit`.
+- **CI test-step comment.** It said `cyrius tests` would also work. That verb is deprecated at this pin and removed at
+  6.7.12; the comment now names `cyrius test tests`. The gate itself is unchanged.
+
+### Verified
+
+- **Tests:** 212 passed. **Coverage:** 10/15 (66%), unchanged. **Lock:** `cyrius deps --locked` is clean.
+- **Reproducibility:** a build from the tracked files alone, with no `cyrius.lock` or `build/`, matches on both sha256s
+  and adds only the gitignored `cyrius.lock`.
+- **The real read path, not just the in-process reader:** `/dev/kmsg` was bind-mounted over with a fake log inside a
+  private `unshare -Urm` namespace, then the 6.6.20 and 6.7.9 host binaries were run over it. Full, `-w` and `-e` are
+  byte-identical across the two, and a 109,222 B log comes out whole. A regular file is not the real device (one read
+  returns many records), so this does not replace CI's root smoke row.
+- **CI's unprivileged smoke contract:** `--help`, `--bogus` and the refused-open case match the 6.6.20 build exactly.
+- **Not run:** CI's root smoke row against the real `/dev/kmsg`, and `build/klug_agnos` on agnos. It was built, not
+  booted.
+
+### Upstream (cyrius) — found during the bump, not klug's to fix
+
+- `cyrius lib sync --dry-run` still prints raw pointers at 6.7.9. Fixed upstream at 6.7.12 (TL-14), so it clears at a
+  later pin.
+- `cyrius lib sync` (24 files) and the build's dependency resolver (25: + `poison.cyr`) still disagree on the closure of
+  `alloc.cyr`'s `#ifdef CYRIUS_POISON` include at 6.7.9. No upstream issue was found for it.
+
 ## [0.2.1] - 2026-10-13 (cyrius 6.6.20; the Linux dump is the whole log, not its oldest 64 KB)
 
 Toolchain **6.6.6 → 6.6.20** with a vendored-`lib/` re-sync, then an audit pass. The audit found one real bug in
