@@ -7,6 +7,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-01 (cyrius 6.7.18; klug runs with no /proc, and its flags still work)
+
+Toolchain **6.7.9 → 6.7.18** with a vendored-`lib/` re-sync, then a fix for the one real bug the bump turned up. Tests
+**212 → 267**. Both shipped binaries changed (`build/klug` 161,328 → 165,560 B · `build/klug_agnos` 177,960 → 182,320
+B). The toolchain alone accounts for 161,344 / 178,104 B (the 0.3.0 source rebuilt at 6.7.18), so klug's own change is
++4,216 B on each: `.text` grew 1,464 / 992 B and crossed a page, which moved the data segment 4,096 B. Both binaries
+reproduce byte-for-byte from a pristine copy of the tracked tree.
+
+### Fixed
+
+- ⛔ **On Linux with no readable `/proc/self/cmdline`, klug lost its whole command line and said nothing.**
+  `lib/args.cyr` reads argv only from there, so with no `/proc` (a chroot, a minimal container), no free fd or no heap,
+  `argc()` is 0. `klug -e` then printed the whole 109,222 B log instead of its 37 B of errors, `klug --bogus` dumped it
+  instead of exiting 2, and `klug --help` dumped it instead of helping, all with exit 0. That broke `main.cyr`'s rule
+  that flags are rejected, never ignored. It was not a 6.7.18 regression (0.3.0 does the same), and agnos was never
+  affected, because it reads the initial stack.
+  - **Fix: `klug_args_open` always leaves klug running.** A kernel log reader is what you reach for when the box is
+    already sick, so klug never refuses to run. It works down three steps:
+    1. `lib/args.cyr`: the normal path, and the only one agnos uses.
+    2. The initial stack, where the kernel puts argv whether or not `/proc` exists. The flags work exactly as usual,
+       so nothing needs saying. `klug_stack_argc` checks the shape first: pointers above `sp`, and the NULL at exactly
+       `argv[argc]`.
+    3. Neither: the whole log, which holds everything a filter would have shown, and a note on stderr that the flags
+       were not applied. The exit code stays the dump's own.
+  - `klug_args_lost` also treats a successful read with no arguments as lost, because Linux always gives a program
+    `argv[0]`. An empty `/proc/self/cmdline` printed the whole log too.
+  - Step 2 runs only after step 1 failed, so a healthy run never walks the stack.
+  - Linux gets no entry park from the compiler (agnos and macOS do), so `klug_init_sp` finds the stack by climbing the
+    frame chain: top-level code never moves `rsp`, and the kernel starts a process with `rbp` = 0. That leans on the
+    compiler's layout, so `test_init_stack_is_the_kernels` pins it against this process's real argv and goes red at any
+    pin bump that changes it. At runtime a changed layout lands on step 3.
+  - **One case still exits 1: `/dev/kmsg` itself cannot be opened**, as in a chroot with no `/dev`. The flags and
+    `--help` work there, but klug has no log to read, and says so.
+
+### Changed
+
+- **Toolchain `6.7.9` → `6.7.18`.**
+  - **Vendored `lib/` re-synced.** `cyrius lib sync` copied **24/24** declared-closure files, and `cyrius update` found
+    nothing further. All 25 tracked files, `poison.cyr` included, byte-match the 6.7.18 snapshot, and
+    `cyrius deps --locked` and `--verify` are clean. klug has no `[deps.*]` entries, so the stdlib is its only
+    dependency. 19 files changed:
+    - `args`: `args_init` reads to EOF instead of doing one 2 MiB read, and returns the bytes read or a negative errno
+      (it returned 0 on failure). `klug_args_open` is built on that result. See *Fixed*.
+    - `syscalls_x86_64_agnos`: the `SYS_*` table only gained numbers (109, 110, 111). None moved, and `SYS_KLUG` is
+      still 36. The socket-fd check was rewritten, which klug does not reach: it writes through
+      `syscall(SYS_WRITE, ..)`.
+    - `syscalls_linux_common`, `syscalls_x86_64_linux`: `SYS_POLL` named, `epoll_event_*` accessors added.
+    - `io`, `vec`, `result`: 307 / 25 / 4 changed code lines. klug reaches none of them; `println`, `strlen` and
+      `streq` live in `string`, which did not change.
+    - `alloc`, `args_agnos`, `fmt`, `fnptr`, `syscalls`: comments only.
+    - `alloc_cx`, `alloc_windows`, `args_macos`, `args_win`, `syscalls_aarch64_linux`, `syscalls_macos`,
+      `syscalls_windows`: targets klug does not ship.
+  - **The 6.7.10–6.7.18 upgrade notes.** These run to 1,582 entries in `ecosystem-migration.md`. They were triaged
+    against klug's language surface (plain `var` / `fn` / `while` / `if`, `load8`, `syscall`, `fncall2` / `fncall3`, one
+    enum, one global array), not read one by one, and the machine-code comparison under *Verified* is what clears the
+    rest. Checked by name:
+    - 6.7.12, `args_init`'s new return: see *Fixed*.
+    - 6.7.12, `cyrius tests` removed: CI does not run it.
+    - 6.7.14, read and write loops that treat 0 as done: Windows only.
+    - 6.7.14, a global whose initializer folds to a constant no longer re-runs at startup: see *Verified*.
+    - 6.7.15, raw syscall numbers warn: klug spells them `SYS_*`, and the build is warning-free.
+    - 6.7.17, a statement that is only a value builtin is refused: the build is clean.
+  - **`cyrius audit` still exits 1**, on the docs stage. Every undocumented fn is a test fn (55, up from 44 with the new
+    tests); `src/` has none. fmt, lint and tests are clean, with no new lint warnings.
+- **CI smoke: klug must run with no `/proc`.** CI covers `/proc` in a private mount namespace and asserts that `-w`,
+  `-e`, `--help` and `--bogus` behave exactly as they do with it, against the real `/dev/kmsg`. `ulimit -n 3` checks the
+  same failure with no root.
+
+### Added
+
+- **13 tests, 55 assertions** for the command line:
+  - fake initial stacks: the kernel's shape, and everything that is not one (wrong argc, a pointer at or below `sp`, no
+    stack, past the bound);
+  - fake frame chains: the outermost frame, chains that loop or run down the stack, past the bound;
+  - `klug_args_lost`'s table: ENOENT, EACCES, EMFILE, ENOMEM, an empty command line, and the two healthy shapes;
+  - step 2 reads the flags, and step 3 returns without trusting a bad stack;
+  - **this process's own stack**: the frame walk lands on the kernel's argc, and every argv matches `/proc`'s;
+  - **`args_init` really failing**: `RLIMIT_NOFILE` drops to 0 in-process, `args_init` returns -EMFILE, and the command
+    line comes off the stack;
+  - a healthy run stays on `lib/args.cyr`.
+
+  **Mutation-checked**: 21 of 22 mutants redden at least one row. The 22nd turns `up <= f` into `up < f`, which is
+  equivalent: a frame that saved itself stops at the hop bound with the same answer. The first pass left three real
+  gaps, each closed with a row of its own: a fallback that never fires, a chain running down the stack to a clean end,
+  and `klug_frame` returning a frame that is already gone.
+
+### Verified
+
+- **Tests:** 267 passed. **Coverage:** 19/24 (66% → 79%). The five unreferenced fns are the same I/O shell as 0.2.1's.
+- **The fix, in real binaries with `/proc` covered** (private namespace, fake `/dev/kmsg`):
+  - `-e` 37 B, `-w` 94 B, `--help` 535 B and `--bogus` exit 2, all as with `/proc`;
+  - step 3, with the stack reader forced to fail: the whole log intact, the note on stderr, exit 0;
+  - an empty `cmdline`: `-e` 37 B and `--help` 535 B, where 6.7.9 printed the whole log;
+  - 5,000 flags, past `KLUG_ARGV_MAX`: step 3, exit 0.
+- **The CI row itself:** run verbatim from `ci.yml` under a `sudo` shim, it passes on this build and fails on the 6.7.9
+  build, in both its `ulimit` and its namespace half.
+- **A healthy run:** full, `-w`, `-e`, `-e --warn`, `--help` and `--bogus` are byte-identical to the 6.7.9 build's.
+- **The fix on agnos:** the normalised comparison below, against the 0.3.0 source at 6.7.18. All but two of its 2,887
+  instructions match; those two are `jmp` distances over the new fns. `main`'s three calls now go through
+  `klug_args_open` / `klug_argc` / `klug_argv`, which on agnos do what `args_init` / `argc` / `argv` did.
+- **The toolchain step alone: klug's machine code, 6.7.9 against 6.7.18, both from the 0.3.0 source.** Normalised
+  disassembly of klug's own fns, aligned instruction by instruction, every difference accounted for. As a control, one
+  changed constant came out as exactly one changed instruction.
+  - agnos: all 2,325 instructions of klug's own code are identical.
+  - Linux: one real change. `O_RDONLY | O_NONBLOCK` now folds to `0x800` at compile time, which shortens `klug_dump` by
+    7 B and so shortens two tail-call `jmp`s by the same 7 B.
+  - Both: the rest is startup stores. New enum values went in, and 28 / 29 `= 0` stores went out. Those stores pointed
+    into the file-backed part of the data segment, so nothing now depends on the agnos loader clearing `.bss`.
+  - This does not cover stdlib code, which is what the `lib/` review above is for.
+- **The real read path:** the namespace runs above use a fake `/dev/kmsg`, where a 109,222 B log comes out whole. This
+  has the limit 0.3.0 described.
+- **Reproducibility:** a build from the tracked files alone matches on both sha256s and adds only the gitignored
+  `cyrius.lock`.
+- **CI's unprivileged smoke contract:** `--help`, `--bogus` and the refused-open case match the 6.7.9 build exactly.
+- **0.3.0's open item is closed:** CI and Release passed on `07fcb0e`, so the root smoke row has run against a real
+  `/dev/kmsg` at 6.7.9.
+- **Not run:** CI's root smoke rows at 6.7.18, including the new one, against a real `/dev/kmsg`. They run when this is
+  pushed. `build/klug_agnos` was built, not booted.
+
+### Upstream (cyrius) — found during the bump, not klug's to fix
+
+- `cyrius lib sync --dry-run` prints file names at this pin, which clears 0.3.0's entry.
+- `cyrius lib sync` (24 files) and the build's dependency resolver (25: + `poison.cyr`) still disagree at 6.7.18.
+- The `/proc` dependency under *Fixed* is open upstream as
+  `docs/development/issues/2026-10-31-cyrius-linux-argv-needs-proc.md`, with no release placed. Its proposed fix is to
+  park `rsp` at entry on Linux, as agnos and macOS do. `klug_init_sp` can go when that lands.
+
 ## [0.3.0] - 2026-11-01 (cyrius 6.7.9)
 
 Toolchain **6.6.20 → 6.7.9** with a vendored-`lib/` re-sync. klug's own source did not change, and neither did its

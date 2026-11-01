@@ -85,6 +85,13 @@ jobs:
         #     LAST: the full dump must be over 64 KB and carry all three, `-w` the
         #     warning and the err but not the info, `-e` only the err. Before 0.2.1
         #     the markers sit past the cut, and this row fails.
+        #   · ⛔ the 0.3.1 row — klug RUNS with no /proc, and its flags still work.
+        #     lib/args.cyr reads argv only from /proc/self/cmdline, so through 0.3.0
+        #     every flag vanished with no /proc: `klug -e` dumped the whole log,
+        #     `klug --help` dumped it too, and both exited 0. With /proc covered in a
+        #     private mount namespace klug must read argv off the initial stack and
+        #     behave exactly as it does above. `ulimit -n 3` is the same failure with
+        #     no root: no free fd to open /proc/self/cmdline.
         run: |
           set -eu
           ./build/klug --help > help.txt
@@ -121,4 +128,25 @@ jobs:
           if grep -q ';klug-ci marker info$' warn.txt; then echo "-w leaked the info marker"; exit 1; fi
           grep -q ';klug-ci marker err$' errs.txt
           if grep -q ';klug-ci marker warning$' errs.txt; then echo "-e leaked the warning marker"; exit 1; fi
+          (ulimit -n 3; ./build/klug --help) > nofd.txt
+          cmp help.txt nofd.txt
+          mkdir -p noproc
+          sudo unshare -m sh -eu -c '
+            mount --bind noproc /proc
+            test ! -e /proc/self/cmdline
+            ./build/klug > np_full.txt
+            ./build/klug -w > np_warn.txt
+            ./build/klug -e > np_errs.txt
+            ./build/klug --help > np_help.txt
+            rc=0; ./build/klug --bogus > np_out.txt 2> np_err.txt || rc=$?
+            test "$rc" = 2
+            test ! -s np_out.txt
+            test -s np_err.txt
+          '
+          cmp help.txt np_help.txt
+          grep -q ';klug-ci marker err$' np_full.txt
+          grep -q ';klug-ci marker warning$' np_warn.txt
+          grep -q ';klug-ci marker err$' np_errs.txt
+          if grep -q ';klug-ci marker info$' np_warn.txt; then echo "-w was ignored with no /proc"; exit 1; fi
+          if grep -q ';klug-ci marker warning$' np_errs.txt; then echo "-e was ignored with no /proc"; exit 1; fi
           echo "smoke: full=$(wc -l < full.txt) lines / $(wc -c < full.txt) B, -w=$(wc -l < warn.txt), -e=$(wc -l < errs.txt)"

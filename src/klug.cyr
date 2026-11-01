@@ -8,8 +8,8 @@
 #
 # Pure helpers + the dump routine live here (no top-level execution) so the test
 # harness can include the module. `src/main.cyr` is the entry. The libs this
-# module uses (syscalls / io / string) are included by main.cyr and the harness
-# before this file, per the project-include convention.
+# module uses (syscalls / io / string / args) are included by main.cyr and the
+# harness before this file, per the project-include convention.
 
 # main.cyr declares `var klug_buf[KLUG_RING_WORDS]`, so this enum IS the buffer's
 # extent. A `var X[N]` is N×u64, so the buffer size and the byte count below can no
@@ -325,6 +325,129 @@ fn klug_write_loop(writer, mode, p, len): i64 {
 fn klug_err_line(s: cstring): i64 {
     syscall(SYS_WRITE, 2, s, strlen(s));
     syscall(SYS_WRITE, 2, "\n", 1);
+    return 0;
+}
+
+# ⛔ klug ALWAYS RUNS. It is what you reach for when the box is already sick, so nothing about
+# its own command line may stop it, and nothing may silently change what it prints. On Linux
+# lib/args.cyr reads argv only from /proc/self/cmdline, so with no /proc (a chroot, a minimal
+# container), no free fd or no heap, argc() is 0. Through 0.3.0 every flag then vanished without
+# a word: `klug -e` dumped the whole log, `klug --help` dumped it too, and both exited 0.
+#
+# argv does not live in /proc. The kernel builds it on the initial stack, [sp]=argc,
+# [sp+8+i*8]=argv[i], then a NULL, which is where agnos and macOS read it. So, in order:
+#   1. lib/args.cyr: the normal path, and the only one agnos needs (its entry parks the stack).
+#   2. the initial stack: the flags still work, and nothing needs saying.
+#   3. neither: dump the WHOLE log and say so on stderr. It is a superset of what any filter
+#      would print, so the line an operator came for is in it. NEVER refuse to run.
+#
+# ⚠ Step 2 is reached only after step 1 failed, so a healthy run never walks the stack.
+
+# The longest argv and the deepest call chain the stack readers walk. klug takes a handful of
+# flags; past these bounds it is step 3, not a crash.
+var KLUG_ARGV_MAX = 4096;
+var KLUG_FRAME_MAX = 64;
+
+# The initial stack klug_argc / klug_argv read, or 0 for lib/args.cyr's copy of the command line.
+var klug_stack_args = 0;
+
+# argc of the initial stack at `sp`, or -1 when `sp` is not one: argv[] must be pointers above
+# `sp` (the strings sit over the array) that reach their NULL at exactly argv[argc]. The walk
+# stops at the first NULL, so it never reads past the array.
+fn klug_stack_argc(sp): i64 {
+    if (sp == 0) { return 0 - 1; }
+    var n = 0;
+    var p = load64(sp + 8);
+    while (p != 0) {
+        if (p <= sp) { return 0 - 1; }
+        if (n >= KLUG_ARGV_MAX) { return 0 - 1; }
+        n = n + 1;
+        p = load64(sp + 8 + n * 8);
+    }
+    if (n != load64(sp)) { return 0 - 1; }
+    return n;
+}
+
+# argc(), wherever klug_args_open found the command line.
+fn klug_argc(): i64 {
+    if (klug_stack_args != 0) { return klug_stack_argc(klug_stack_args); }
+    return argc();
+}
+
+# argv(n), wherever klug_args_open found the command line.
+fn klug_argv(n): i64 {
+    if (klug_stack_args != 0) { return load64(klug_stack_args + 8 + n * 8); }
+    return argv(n);
+}
+
+# Did lib/args.cyr lose the command line? `rc` is args_init's result: a negative errno since
+# cyrius 6.7.12. A success with `ac` 0 counts too, because Linux always gives a program at least
+# argv[0], so an empty /proc/self/cmdline is a lost command line, not an empty one.
+fn klug_args_lost(rc, ac): i64 {
+    if (rc < 0) { return 1; }
+    if (ac < 1) { return 1; }
+    return 0;
+}
+
+# Steps 2 and 3. Reads the flags from the initial stack at `sp` and returns 1; or, when `sp` is
+# not one, says on stderr that the flags are gone and returns 0, and the dump goes ahead whole.
+fn klug_args_recover(sp): i64 {
+    if (klug_stack_argc(sp) >= 0) {
+        klug_stack_args = sp;
+        return 1;
+    }
+    klug_err_line("klug: cannot read the command line, so any flags are NOT applied:");
+    klug_err_line("      dumping the whole log instead.");
+    return 0;
+}
+
+#ifndef CYRIUS_TARGET_AGNOS
+# The caller's frame pointer: the saved rbp, so a frame that is still live when this returns.
+# The same shape as lib/args_agnos.cyr's r15 read. 0 on aarch64, which lands on step 3.
+fn klug_frame(): i64 {
+    var result = 0;
+    #ifndef CYRIUS_ARCH_AARCH64
+    asm {
+        0x48; 0x8B; 0x45; 0x00;    # mov rax, [rbp]
+        0x48; 0x89; 0x45; 0xF8;    # mov [rbp-8], rax   (-> result, the first local)
+    }
+    #endif
+    return result;
+}
+
+# Climb the frame chain from `f` to the outermost frame and return the stack pointer of whatever
+# called it, or 0 when the chain does not end cleanly. Pure over the chain: the tests walk fakes.
+fn klug_frame_walk(f): i64 {
+    var hops = 0;
+    while (f != 0) {
+        var up = load64(f);
+        if (up == 0) { return f + 16; }
+        if (up <= f) { return 0; }                      # a frame chain climbs the stack
+        if (hops >= KLUG_FRAME_MAX) { return 0; }
+        hops = hops + 1;
+        f = up;
+    }
+    return 0;
+}
+
+# The kernel's initial stack, or 0 when it cannot be found. Linux gets no entry park (that is
+# agnos and macOS), but it needs none: cyrius's top-level code runs on the kernel's rsp and never
+# moves it, and the kernel starts a process with rbp = 0, so the frame chain ends at the first
+# fn top-level called. Its saved rbp is that 0, its return address is at rbp+8, and the kernel's
+# rsp is at rbp+16. test_init_stack_is_the_kernels pins this against the real argv, so a compiler
+# that changes the layout goes red at its pin bump; here it only lands on step 3.
+fn klug_init_sp(): i64 {
+    var sp = klug_frame_walk(klug_frame());
+    return sp;                                          # not a tail call: that pops klug_frame's frame
+}
+#endif
+
+# Set up the command line for klug_argc / klug_argv. Whatever happens here, klug runs.
+fn klug_args_open(): i64 {
+    var rc = args_init();
+    #ifndef CYRIUS_TARGET_AGNOS
+    if (klug_args_lost(rc, argc()) == 1) { klug_args_recover(klug_init_sp()); }
+    #endif
     return 0;
 }
 

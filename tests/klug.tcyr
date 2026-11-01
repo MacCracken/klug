@@ -13,7 +13,9 @@
 #     including the agnos backpressure arm, which used to run only on iron;
 #   · the /dev/kmsg drain, `klug_kmsg_drain`, driven through a scripted fake reader
 #     that refuses a record that does not fit exactly as devkmsg_read does — so a log
-#     bigger than the buffer, -EAGAIN / -EPIPE / -EINTR and a failed read all run here.
+#     bigger than the buffer, -EAGAIN / -EPIPE / -EINTR and a failed read all run here;
+#   · the command line when /proc cannot give it, `klug_args_open`'s fallback: fake initial
+#     stacks for the reader, and this process's real stack for the frame walk that finds it.
 
 include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
@@ -21,6 +23,7 @@ include "lib/fnptr.cyr"
 include "lib/string.cyr"
 include "lib/fmt.cyr"
 include "lib/io.cyr"
+include "lib/args.cyr"
 include "lib/assert.cyr"
 include "src/klug.cyr"
 
@@ -832,6 +835,226 @@ fn test_emit_lines_counts_tags_and_reports_failure() {
     return 0;
 }
 
+# A fake initial stack, shaped as the kernel builds it: [0]=argc, [1..]=argv[i], a NULL, and the
+# strings ABOVE the array, because klug_stack_argc refuses a pointer that is not.
+var _st[64];                # ×u64 = 512 B
+var _st_top = 0;            # the next free string byte, as an offset from &_st
+
+fn _st_word(i, v): i64 {
+    store64(&_st + i * 8, v);
+    return 0;
+}
+
+fn _st_str(s): i64 {
+    var p = &_st + _st_top;
+    var n = strlen(s);
+    var i = 0;
+    while (i <= n) {
+        store8(p + i, load8(s + i));
+        i = i + 1;
+    }
+    _st_top = _st_top + n + 1;
+    return p;
+}
+
+# A stack holding argv = { a, b, c }.
+fn _st_args3(a, b, c): i64 {
+    var i = 0;
+    while (i < 64) {
+        _st_word(i, 0);
+        i = i + 1;
+    }
+    _st_top = 256;
+    _st_word(0, 3);
+    _st_word(1, _st_str(a));
+    _st_word(2, _st_str(b));
+    _st_word(3, _st_str(c));
+    return &_st;
+}
+
+fn test_stack_args_read_the_kernels_shape() {
+    var sp = _st_args3("klug", "-e", "--warn");
+    assert_eq(klug_stack_argc(sp), 3, "argc is the array's length");
+    _st_word(3, 0);
+    _st_word(0, 2);
+    assert_eq(klug_stack_argc(sp), 2, "a shorter argv");
+    _st_word(2, 0);
+    _st_word(1, 0);
+    _st_word(0, 0);
+    assert_eq(klug_stack_argc(sp), 0, "an empty argv is still a stack (argc 0, pre-5.18 Linux)");
+    return 0;
+}
+
+fn test_stack_args_refuse_what_is_not_a_stack() {
+    assert_eq(klug_stack_argc(0), 0 - 1, "no stack at all");
+    var sp = _st_args3("klug", "-e", "-w");
+    _st_word(0, 2);
+    assert_eq(klug_stack_argc(sp), 0 - 1, "argc short of the array: the NULL is not at argv[argc]");
+    _st_word(0, 4);
+    assert_eq(klug_stack_argc(sp), 0 - 1, "argc past the array: the NULL is not at argv[argc]");
+    sp = _st_args3("klug", "-e", "-w");
+    _st_word(2, sp);
+    assert_eq(klug_stack_argc(sp), 0 - 1, "a pointer at sp is not a string above the array");
+    _st_word(2, sp - 8);
+    assert_eq(klug_stack_argc(sp), 0 - 1, "a pointer below sp is not a string above the array");
+    return 0;
+}
+
+fn test_stack_args_walk_is_bounded() {
+    var keep = KLUG_ARGV_MAX;
+    var sp = _st_args3("klug", "-e", "-w");
+    KLUG_ARGV_MAX = 3;
+    assert_eq(klug_stack_argc(sp), 3, "exactly the bound is a stack");
+    KLUG_ARGV_MAX = 2;
+    assert_eq(klug_stack_argc(sp), 0 - 1, "past the bound is step 3, not a long walk");
+    KLUG_ARGV_MAX = keep;
+    return 0;
+}
+
+fn test_args_lost_table() {
+    assert_eq(klug_args_lost(0 - 2, 0), 1, "ENOENT: no /proc");
+    assert_eq(klug_args_lost(0 - 13, 0), 1, "EACCES: /proc refused");
+    assert_eq(klug_args_lost(0 - 24, 0), 1, "EMFILE: no free fd");
+    assert_eq(klug_args_lost(0 - 12, 0), 1, "ENOMEM: no heap");
+    assert_eq(klug_args_lost(0 - 2, 3), 1, "a failure is a failure whatever argc says");
+    assert_eq(klug_args_lost(0, 0), 1, "an empty cmdline: Linux always gives argv[0]");
+    assert_eq(klug_args_lost(5, 1), 0, "healthy: bytes read, argv[0] there");
+    assert_eq(klug_args_lost(0, 1), 0, "healthy: 0 is a success (macOS answers it)");
+    return 0;
+}
+
+fn test_args_recover_reads_the_flags_off_the_stack() {
+    klug_stack_args = 0;
+    var sp = _st_args3("klug", "-e", "--warn");
+    assert_eq(klug_args_recover(sp), 1, "step 2: the flags survived");
+    assert_eq(klug_argc(), 3, "klug_argc reads the stack");
+    assert(streq(klug_argv(0), "klug") == 1, "klug_argv(0) reads the stack");
+    assert(streq(klug_argv(1), "-e") == 1, "klug_argv(1) reads the stack");
+    assert(streq(klug_argv(2), "--warn") == 1, "klug_argv(2) reads the stack");
+    klug_stack_args = 0;
+    return 0;
+}
+
+fn test_args_recover_never_refuses() {
+    klug_stack_args = 0;
+    assert_eq(klug_args_recover(0), 0, "step 3: no stack, no flags, and it returns");
+    assert_eq(klug_stack_args, 0, "step 3: nothing to read");
+    var sp = _st_args3("klug", "-e", "-w");
+    _st_word(0, 9);
+    assert_eq(klug_args_recover(sp), 0, "step 3: a bad stack is not trusted");
+    assert_eq(klug_stack_args, 0, "step 3: a bad stack is not read");
+    return 0;
+}
+
+# A fake frame chain: each frame's first word is the saved rbp of the one that called it.
+var _fr[8];
+
+fn test_frame_walk_ends_at_the_outermost_frame() {
+    assert_eq(klug_frame_walk(0), 0, "no frame");
+    store64(&_fr, 0);
+    assert_eq(klug_frame_walk(&_fr), &_fr + 16, "one frame: its caller's sp is rbp+16");
+    store64(&_fr, &_fr + 16);
+    store64(&_fr + 16, &_fr + 32);
+    store64(&_fr + 32, 0);
+    assert_eq(klug_frame_walk(&_fr), &_fr + 48, "three frames: the outermost one's caller");
+    return 0;
+}
+
+fn test_frame_walk_refuses_a_broken_chain() {
+    store64(&_fr, &_fr);
+    assert_eq(klug_frame_walk(&_fr), 0, "a frame that saved itself");
+    store64(&_fr + 16, &_fr);
+    assert_eq(klug_frame_walk(&_fr + 16), 0, "a chain that runs down the stack");
+    store64(&_fr, 0);
+    assert_eq(klug_frame_walk(&_fr + 16), 0, "a chain that runs down the stack to a clean end");
+    return 0;
+}
+
+# klug_frame must name its CALLER's frame, which is above this fn's locals and still live. Its
+# own frame is below them and gone by the time it returns, so a walk from there reads popped
+# stack. That read usually still works, which is why it needs its own row.
+fn test_frame_is_the_callers_and_still_live() {
+    var local = 0;
+    var here = &local;
+    assert(klug_frame() > here, "klug_frame names the caller's frame");
+    return 0;
+}
+
+fn test_frame_walk_is_bounded() {
+    var keep = KLUG_FRAME_MAX;
+    store64(&_fr, &_fr + 16);
+    store64(&_fr + 16, &_fr + 32);
+    store64(&_fr + 32, 0);
+    KLUG_FRAME_MAX = 2;
+    assert_eq(klug_frame_walk(&_fr), &_fr + 48, "exactly the bound is a chain");
+    KLUG_FRAME_MAX = 1;
+    assert_eq(klug_frame_walk(&_fr), 0, "past the bound is step 3, not a long walk");
+    KLUG_FRAME_MAX = keep;
+    return 0;
+}
+
+# ⛔ NOT A FAKE: this is this process's own stack. klug_init_sp leans on the compiler's layout
+# (top-level never moves rsp, every fn keeps an rbp frame), so this is what catches a compiler
+# that changes it. The fallback itself would only land on step 3, losing the flags quietly.
+fn test_init_stack_is_the_kernels() {
+    klug_stack_args = 0;
+    assert(args_init() > 0, "harness: lib/args.cyr reads /proc/self/cmdline here");
+    assert(argc() >= 1, "harness: at least argv[0]");
+    var sp = klug_init_sp();
+    var n = klug_stack_argc(sp);
+    assert_eq(n, argc(), "the frame walk lands on the kernel's argc");
+    var i = 0;
+    while (i < n) {
+        assert(streq(load64(sp + 8 + i * 8), argv(i)) == 1, "the kernel's argv[i] is /proc's");
+        i = i + 1;
+    }
+    assert_eq(klug_args_recover(sp), 1, "the real stack passes the reader's checks");
+    assert_eq(klug_argc(), argc(), "both readers agree on argc");
+    klug_stack_args = 0;
+    return 0;
+}
+
+# x86_64 Linux's setrlimit: lib/syscalls names only the get half.
+var _SYS_SETRLIMIT = 160;
+var _RLIMIT_NOFILE = 7;
+var _rl[2];                 # { soft, hard }
+var _open_rc = 0;
+
+# Run klug_args_open with no fd to be had, so args_init REALLY fails (-EMFILE) in this process.
+fn _args_open_without_fds(): i64 {
+    assert_eq(sys_getrlimit(_RLIMIT_NOFILE, &_rl), 0, "harness: read the fd limit");
+    var soft = load64(&_rl);
+    store64(&_rl, 0);
+    assert_eq(syscall(_SYS_SETRLIMIT, _RLIMIT_NOFILE, &_rl), 0, "harness: take the fds away");
+    _open_rc = args_init();
+    var r = klug_args_open();
+    store64(&_rl, soft);
+    assert_eq(syscall(_SYS_SETRLIMIT, _RLIMIT_NOFILE, &_rl), 0, "harness: give the fds back");
+    return r;
+}
+
+fn test_args_open_recovers_when_args_init_really_fails() {
+    klug_stack_args = 0;
+    assert(args_init() > 0, "harness: lib/args.cyr reads /proc/self/cmdline here");
+    var ac = argc();
+    assert_eq(_args_open_without_fds(), 0, "it never fails");
+    assert_eq(_open_rc, 0 - 24, "harness: args_init really failed, -EMFILE");
+    assert(klug_stack_args != 0, "the command line came off the initial stack");
+    assert_eq(klug_argc(), ac, "the stack's argc is /proc's");
+    assert(streq(klug_argv(0), argv(0)) == 1, "the stack's argv[0] is /proc's");
+    klug_stack_args = 0;
+    return 0;
+}
+
+fn test_args_open_leaves_a_healthy_run_alone() {
+    klug_stack_args = 0;
+    assert_eq(klug_args_open(), 0, "it never fails");
+    assert_eq(klug_stack_args, 0, "a healthy run stays on lib/args.cyr");
+    assert_eq(klug_argc(), argc(), "klug_argc is argc");
+    assert_eq(klug_argv(0), argv(0), "klug_argv is argv");
+    return 0;
+}
+
 fn main(): i64 {
     test_group("klug severity lens — recognized prefixes");
     test_recognized_prefixes();
@@ -892,6 +1115,20 @@ fn main(): i64 {
     test_drain_retries_are_bounded();
     test_drain_write_failure_stops_reading();
     test_drain_production_constants();
+    test_group("klug command line — it runs, with or without /proc");
+    test_stack_args_read_the_kernels_shape();
+    test_stack_args_refuse_what_is_not_a_stack();
+    test_stack_args_walk_is_bounded();
+    test_args_lost_table();
+    test_args_recover_reads_the_flags_off_the_stack();
+    test_args_recover_never_refuses();
+    test_frame_walk_ends_at_the_outermost_frame();
+    test_frame_walk_refuses_a_broken_chain();
+    test_frame_walk_is_bounded();
+    test_frame_is_the_callers_and_still_live();
+    test_init_stack_is_the_kernels();
+    test_args_open_recovers_when_args_init_really_fails();
+    test_args_open_leaves_a_healthy_run_alone();
     return assert_summary();
 }
 

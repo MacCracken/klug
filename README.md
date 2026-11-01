@@ -35,6 +35,13 @@ sudo klug -e          # Linux dev host: err-and-worse records from /dev/kmsg
   has a gap. Since 0.2.0 the severity lens works here too, off each record's
   syslog priority (below).
 
+klug always runs. A kernel log reader is what you reach for when the box is already
+sick, so nothing about its own command line can stop it. On Linux its flags normally
+come from `/proc/self/cmdline`; with no `/proc` (a chroot, a minimal container), no free
+file descriptor or no heap, it reads them off the initial stack, where the kernel put
+them, and they work as usual. If even that fails, klug dumps the whole log, which holds
+everything a filter would have shown, and says on stderr that the flags were not applied.
+
 The severity lens (`-w`/`-e`) keys off the `[I]`/`[W]`/`[E]` prefixes the kernel
 emits. Unprefixed lines — boot output and raw `kprintln`, which is most of an AGNOS
 boot log — are level 0, the same as `[I]`: they appear in the default dump, but

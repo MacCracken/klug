@@ -18,14 +18,16 @@ var klug_buf[KLUG_RING_WORDS];
 
 # Entry: parse the severity flag(s), then dump. Exit 0 = dumped (a filter that matched
 # nothing is still 0 — see the stderr note in klug_emit_done), 1 = read or write failed,
-# 2 = usage error. Flags are rejected, never ignored: see the comment in the loop.
+# 2 = usage error. Flags are rejected, never ignored: see the comment in the loop. The one
+# exception is a command line that cannot be read at all, and klug still runs then: see
+# klug_args_open (a whole dump, said on stderr).
 fn main(): i64 {
-    args_init();
+    klug_args_open();
     var min_level = KLUG_LVL_ALL;
-    var ac = argc();
+    var ac = klug_argc();
     var i = 1;
     while (i < ac) {
-        var a = argv(i);
+        var a = klug_argv(i);
         var known = 0;
         if (streq(a, "-h") == 1)     { return klug_usage(); }
         if (streq(a, "--help") == 1) { return klug_usage(); }
